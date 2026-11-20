@@ -278,9 +278,11 @@ pub fn resolve_aliyun_credentials(profile: &Profile) -> Result<AliyunCreds> {
         ));
     }
 
+    // Only qrypt needs a drive id; webdav/aliyundrive-fuse do not.
+    let wants_drive_id = profile.engine.as_deref() == Some("qrypt");
     let drive_id = match profile.drive_id.clone().filter(|id| !id.is_empty()) {
         Some(id) => Some(id),
-        None if std::io::stdin().is_terminal() => {
+        None if wants_drive_id && std::io::stdin().is_terminal() => {
             let id: String = Input::<String>::new()
                 .with_prompt("Aliyun drive id (blank to skip)")
                 .allow_empty(true)

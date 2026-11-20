@@ -432,11 +432,13 @@ fn cmd_config(action: ConfigAction, path: Option<&Path>) -> Result<()> {
             provider,
             profile,
             drive_id,
+            qr,
         } => cmd_config_login(
             &path,
             provider.as_deref(),
             profile.as_deref(),
             drive_id.as_deref(),
+            qr,
         ),
         ConfigAction::Logout { provider, profile } => {
             cmd_config_logout(&path, provider.as_deref(), profile.as_deref())
@@ -494,12 +496,18 @@ fn cmd_config_login(
     provider: Option<&str>,
     profile_name: Option<&str>,
     drive_id: Option<&str>,
+    qr: bool,
 ) -> Result<()> {
     let profile_name = profile_name
         .ok_or_else(|| AppError::Config("config login requires --profile <name>".to_string()))?;
 
     match provider {
         Some("s3") => {
+            if qr {
+                return Err(AppError::Unsupported(
+                    "--qr is only supported for aliyun; use stdin for S3 credentials".to_string(),
+                ));
+            }
             let (access, secret) = read_s3_credentials_interactive()?;
             let path = config_ux::login_s3(config_path, profile_name, &access, &secret)?;
             println!(
@@ -509,7 +517,12 @@ fn cmd_config_login(
             Ok(())
         }
         Some("aliyun") => {
-            let token = read_secret_line("Aliyun refresh token")?;
+            let token = if qr {
+                println!("Starting Aliyun QR login (scan the code in your terminal)...");
+                mount_fs::core::qr_login::qr_login_token()?
+            } else {
+                read_secret_line("Aliyun refresh token")?
+            };
             if token.is_empty() {
                 return Err(AppError::Credential(
                     "refusing to store an empty token".to_string(),

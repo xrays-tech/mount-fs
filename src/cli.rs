@@ -253,6 +253,9 @@ pub enum ConfigAction {
         /// Aliyun OpenAPI drive id (for qrypt/webdav).
         #[arg(long)]
         drive_id: Option<String>,
+        /// Use the interactive QR-code flow (Aliyun only).
+        #[arg(long)]
+        qr: bool,
     },
 
     /// Remove stored credentials for a provider.

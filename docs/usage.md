@@ -249,6 +249,27 @@ mount-fs mount pan-rw
 `qrypt` runs in the foreground; `mount-fs mount` supervises it in the
 background (or use `--foreground` to keep it attached to the terminal).
 
+### QR login: `aliyundrive-webdav` (no drive_id)
+
+`aliyundrive-webdav` needs only an OpenAPI refresh token and can obtain one via
+a scannable QR code. It runs a loopback WebDAV server bridged to FUSE by
+`rclone mount`, and needs no `drive_id`:
+
+```sh
+mount-fs config profile add aliyun --provider aliyun --engine aliyundrive-webdav --mountpoint ~/mnt/aliyun
+mount-fs config login aliyun --profile aliyun --qr     # scan the QR in your terminal
+mount-fs mount aliyun
+```
+
+This flow requires both `aliyundrive-webdav` and `rclone` to be installed. The
+QR is printed by the upstream tool; mount-fs stops echoing before the
+`refresh_token:` block so the token is never shown or logged, then stores it in
+a `0600` credential file and sets the profile's `credentials_ref`.
+
+> QR login yields an **OpenAPI** refresh token. It is not usable with
+> `aliyundrive-fuse` (legacy web token) or with `qrypt` unless you also supply
+> the matching `drive_id`.
+
 If an Aliyun profile requests an engine that is not installed and
 `general.engine_auto_fallback` is `true`, mount-fs may fall back to another
 installed Aliyun engine. Because token kinds differ, verify which engine is

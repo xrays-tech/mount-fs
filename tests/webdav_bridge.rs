@@ -125,12 +125,8 @@ client_secret = "client-secret"
         );
         fs::write(&config_path, config_body).expect("config");
 
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        std::env::set_var("PATH", path);
+        // Keep the test hermetic: no user-installed engines from ~/.local/bin.
+        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
         std::env::set_var("XDG_RUNTIME_DIR", &runtime);
         std::env::set_var("XDG_STATE_HOME", &state);
         std::env::set_var("XDG_CONFIG_HOME", &config_dir);

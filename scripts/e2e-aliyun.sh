@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 #
-# End-to-end Aliyun Drive smoke test for mount-fs, using the `qrypt` engine
-# (the active, read/write engine; needs an OpenAPI refresh token + drive_id).
+# End-to-end Aliyun Drive smoke test for mount-fs.
+#
+# Engine selection (ALIYUN_ENGINE, default = auto):
+#   - aliyundrive-webdav : QR/OpenAPI token, NO drive_id needed. Runs a loopback
+#                          WebDAV server bridged to FUSE via rclone. This is the
+#                          "scan a QR code" path (see `config login aliyun --qr`).
+#   - qrypt              : OpenAPI token + drive_id (read/write, single process).
 #
 # Requirements:
-#   - qrypt installed (mount-fs install qrypt --yes)
-#   - /dev/fuse and an environment where FUSE mounts are permitted (NoNewPrivs=0)
-#   - ALIYUN_REFRESH_TOKEN and ALIYUN_DRIVE_ID in the environment
+#   - FUSE-capable host (/dev/fuse, NoNewPrivs=0)
+#   - the selected engine installed (and `rclone` for webdav)
+#   - ALIYUN_REFRESH_TOKEN in the environment (secret; never placed in argv)
+#   - ALIYUN_DRIVE_ID only for qrypt
 #
-# The token is passed to `config login` on stdin (never argv), and is stored in
-# a 0600 file. The drive_id is not a secret.
-#
-# Usage:
-#   ALIYUN_REFRESH_TOKEN='<token>' ALIYUN_DRIVE_ID='<drive-id>' scripts/e2e-aliyun.sh
+# Obtaining the token (QR, no drive_id -> use webdav):
+#   mount-fs config profile add aliyun --provider aliyun --engine aliyundrive-webdav --mountpoint ~/mnt/aliyun
+#   mount-fs config login aliyun --profile aliyun --qr          # scan the QR
+#   export ALIYUN_REFRESH_TOKEN="$(cat ~/.config/mount-fs/credentials/aliyun.token)"
+#   ALIYUN_ENGINE=aliyundrive-webdav scripts/e2e-aliyun.sh
 #
 # This script is NOT run by `cargo test`.
 #
@@ -30,19 +36,46 @@ skip() {
 # --- environment preflight -------------------------------------------------
 [[ -e /dev/fuse ]] || skip "/dev/fuse is missing"
 grep -q '^NoNewPrivs:[[:space:]]*0' /proc/self/status \
-    || skip "NoNewPrivs is set (run this on a real host / user session, not a restricted sandbox)"
-command -v qrypt >/dev/null 2>&1 \
-    || skip "qrypt not installed (run: $MOUNT_FS install qrypt --yes)"
+    || skip "NoNewPrivs is set (run on a real host / user session, not a restricted sandbox)"
 
-if [[ -z "${ALIYUN_REFRESH_TOKEN:-}" ]] || [[ -z "${ALIYUN_DRIVE_ID:-}" ]]; then
-    echo "SKIP: missing Aliyun credentials."
-    echo "  Set ALIYUN_REFRESH_TOKEN (an Aliyun Drive OpenAPI refresh token) and ALIYUN_DRIVE_ID."
-    echo "  Notes:"
-    echo "    - qrypt does not provide an Aliyun login; obtain the token via an OpenAPI login flow"
-    echo "      (e.g. \`aliyundrive-webdav qr login\`) and the drive_id from the drive-info API,"
-    echo "      OpenList, or an \`aliyunpan\` config (userList[].driveId)."
-    echo "    - If you only have a legacy web refresh token, use the read-only aliyundrive-fuse"
-    echo "      engine instead (no drive_id required)."
+# --- engine selection ------------------------------------------------------
+ENGINE="${ALIYUN_ENGINE:-}"
+if [[ -z "$ENGINE" ]]; then
+    if [[ -n "${ALIYUN_DRIVE_ID:-}" ]] && command -v qrypt >/dev/null 2>&1; then
+        ENGINE="qrypt"
+    elif command -v aliyundrive-webdav >/dev/null 2>&1 && command -v rclone >/dev/null 2>&1; then
+        ENGINE="aliyundrive-webdav"
+    elif command -v qrypt >/dev/null 2>&1; then
+        ENGINE="qrypt"
+    else
+        skip "no Aliyun engine installed (run: mount-fs install qrypt --yes  or  mount-fs install aliyundrive-webdav --yes)"
+    fi
+fi
+
+case "$ENGINE" in
+    qrypt)
+        command -v qrypt >/dev/null 2>&1 || skip "qrypt not installed"
+        ;;
+    aliyundrive-webdav)
+        command -v aliyundrive-webdav >/dev/null 2>&1 || skip "aliyundrive-webdav not installed"
+        command -v rclone >/dev/null 2>&1 || skip "rclone not installed (required for the webdav bridge)"
+        ;;
+    *)
+        skip "unsupported ALIYUN_ENGINE=$ENGINE (use qrypt or aliyundrive-webdav)"
+        ;;
+esac
+echo "Using engine: $ENGINE"
+
+if [[ -z "${ALIYUN_REFRESH_TOKEN:-}" ]]; then
+    echo "SKIP: missing Aliyun credentials (ALIYUN_REFRESH_TOKEN)."
+    echo "  Obtain one with the QR flow (no drive_id needed for aliyundrive-webdav):"
+    echo "    mount-fs config profile add aliyun --provider aliyun --engine aliyundrive-webdav --mountpoint ~/mnt/aliyun"
+    echo "    mount-fs config login aliyun --profile aliyun --qr"
+    echo "    export ALIYUN_REFRESH_TOKEN=\"\$(cat ~/.config/mount-fs/credentials/aliyun.token)\""
+    exit 0
+fi
+if [[ "$ENGINE" == "qrypt" && -z "${ALIYUN_DRIVE_ID:-}" ]]; then
+    echo "SKIP: qrypt needs ALIYUN_DRIVE_ID. (Use ALIYUN_ENGINE=aliyundrive-webdav to avoid drive_id.)"
     exit 0
 fi
 
@@ -62,7 +95,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- isolated XDG + qrypt data dirs (do not touch the user's real config) ---
+# --- isolated XDG + engine data dirs (do not touch the user's real config) --
 export XDG_RUNTIME_DIR="$TMP/runtime"
 export XDG_STATE_HOME="$TMP/state"
 export XDG_CONFIG_HOME="$TMP/config"
@@ -70,20 +103,19 @@ export QRYPT_HOME="$TMP/qrypt"
 mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$QRYPT_HOME" "$MNT"
 
 # --- configure profile + store token (token via stdin, never argv) ---------
-"$MOUNT_FS" --config "$CFG" config profile add "$PROFILE" \
-    --provider aliyun \
-    --engine qrypt \
-    --mountpoint "$MNT" \
-    --drive-id "$ALIYUN_DRIVE_ID"
+ADD_ARGS=(config profile add "$PROFILE" --provider aliyun --engine "$ENGINE" --mountpoint "$MNT")
+[[ -n "${ALIYUN_DRIVE_ID:-}" ]] && ADD_ARGS+=(--drive-id "$ALIYUN_DRIVE_ID")
+"$MOUNT_FS" --config "$CFG" "${ADD_ARGS[@]}"
 
-printf '%s\n' "$ALIYUN_REFRESH_TOKEN" \
-    | "$MOUNT_FS" --config "$CFG" config login aliyun --profile "$PROFILE" --drive-id "$ALIYUN_DRIVE_ID"
+LOGIN_ARGS=(config login aliyun --profile "$PROFILE")
+[[ -n "${ALIYUN_DRIVE_ID:-}" ]] && LOGIN_ARGS+=(--drive-id "$ALIYUN_DRIVE_ID")
+printf '%s\n' "$ALIYUN_REFRESH_TOKEN" | "$MOUNT_FS" --config "$CFG" "${LOGIN_ARGS[@]}"
 
 # --- mount -----------------------------------------------------------------
-echo "Mounting Aliyun Drive via qrypt..."
+echo "Mounting Aliyun Drive via $ENGINE..."
 "$MOUNT_FS" --config "$CFG" mount "$PROFILE"
 
-for _ in $(seq 1 150); do
+for _ in $(seq 1 250); do
     mountpoint -q "$MNT" 2>/dev/null && break
     sleep 0.1
 done
@@ -115,7 +147,7 @@ fi
 # --- unmount + cleanup assertions -----------------------------------------
 "$MOUNT_FS" --config "$CFG" umount "$PROFILE"
 
-for _ in $(seq 1 100); do
+for _ in $(seq 1 200); do
     mountpoint -q "$MNT" 2>/dev/null || break
     sleep 0.1
 done
@@ -129,4 +161,4 @@ if grep -q "\"$PROFILE\"" "$XDG_STATE_HOME/mount-fs/mounts.json" 2>/dev/null; th
     exit 1
 fi
 
-echo "PASS: Aliyun Drive (qrypt) end-to-end mount/read/write/unmount succeeded"
+echo "PASS: Aliyun Drive ($ENGINE) end-to-end mount/read/write/unmount succeeded"

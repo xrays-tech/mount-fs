@@ -7,5 +7,6 @@ pub mod config_ux;
 pub mod creds;
 pub mod install;
 pub mod orchestrator;
+pub mod qr_login;
 pub mod reconcile;
 pub mod state;

@@ -79,7 +79,7 @@ pub fn mount(
         Some(path) => Config::load(path)?,
         None => Config::load_default()?,
     };
-    let (profile_name, profile) = resolve_profile(&config, target, &opts)?;
+    let (profile_name, mut profile) = resolve_profile(&config, target, &opts)?;
 
     let provider = providers::registry()
         .into_iter()
@@ -96,6 +96,9 @@ pub fn mount(
         &profile,
         config.general.engine_auto_fallback,
     )?;
+    // Record the actually selected engine so credential resolution knows
+    // whether a drive id is required (qrypt) or not (webdav/fuse).
+    profile.engine = Some(engine.id().to_string());
 
     let detected = engine.detect();
     if !detected.found {
