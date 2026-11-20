@@ -155,16 +155,17 @@ pub fn default_bin_dir() -> PathBuf {
 /// The binary is copied to a temporary name in the destination directory and
 /// then renamed into place, so a crash never leaves a partial executable.
 pub fn install_binary(src: &Path, bin_dir: &Path) -> Result<PathBuf> {
-    fs::create_dir_all(bin_dir)?;
     let name = src
         .file_name()
         .ok_or_else(|| AppError::Archive("archive contains a nameless binary".to_string()))?;
+    install_binary_as(src, bin_dir, &name.to_string_lossy())
+}
+
+/// Install `src` under an explicit `name` with mode 0755 (atomic rename).
+pub fn install_binary_as(src: &Path, bin_dir: &Path, name: &str) -> Result<PathBuf> {
+    fs::create_dir_all(bin_dir)?;
     let dest = bin_dir.join(name);
-    let temp = bin_dir.join(format!(
-        ".{}.tmp-{}",
-        name.to_string_lossy(),
-        std::process::id()
-    ));
+    let temp = bin_dir.join(format!(".{name}.tmp-{}", std::process::id()));
 
     if let Err(err) = fs::copy(src, &temp) {
         let _ = fs::remove_file(&temp);
@@ -249,6 +250,25 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn installs_under_explicit_name() {
+        let temp = tempdir();
+        let src = temp.path().join("qrypt-linux-amd64");
+        fs::write(&src, b"binary").expect("write");
+        let bin_dir = temp.path().join("bin");
+        let installed = install_binary_as(&src, &bin_dir, "qrypt").expect("install");
+        assert_eq!(installed, bin_dir.join("qrypt"));
+        assert!(installed.exists());
+        assert_eq!(
+            fs::metadata(&installed)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
     }
 
     #[test]

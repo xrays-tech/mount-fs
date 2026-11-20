@@ -4,8 +4,8 @@
 //! checksum verification), and printed source-build recipes. Downloads are only
 //! performed when explicitly authorized (`--yes` and not `--dry-run`).
 
-use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -13,7 +13,7 @@ use crate::engines::{Engine, InstallMethod, InstallPlan, ReleaseAsset};
 use crate::error::{AppError, Result};
 use crate::system::checksums;
 use crate::system::distro::Distro;
-use crate::system::download::{self, default_bin_dir, install_binary};
+use crate::system::download::{self, default_bin_dir, install_binary_as};
 use crate::system::pkg::PackageManager;
 use crate::system::privilege::{choose_escalation, escalated_argv};
 
@@ -169,21 +169,96 @@ fn download_and_install(asset: &ReleaseAsset, work: &Path) -> Result<PathBuf> {
     verify_download(&archive, asset)?;
 
     let files = download::extract(&archive, asset.kind, &work.join("extract"))?;
-    let binary = files
-        .iter()
-        .find(|path| {
-            path.file_name()
-                .map(|name| name == OsStr::new(&asset.binary))
-                .unwrap_or(false)
-        })
-        .ok_or_else(|| {
-            AppError::Archive(format!(
-                "archive {} does not contain `{}`",
-                asset.url, asset.binary
-            ))
-        })?;
+    let binary = locate_binary(&files, &asset.binary).ok_or_else(|| {
+        let mut names: Vec<String> = files
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        let found = if names.is_empty() {
+            "<none>".to_string()
+        } else {
+            names.join(", ")
+        };
+        AppError::Archive(format!(
+            "archive {} does not contain `{}` (candidates: {found})",
+            asset.url, asset.binary
+        ))
+    })?;
 
-    install_binary(binary, &default_bin_dir())
+    // Install under the expected name even when the archive member is versioned
+    // (e.g. `qrypt-linux-amd64` -> `qrypt`).
+    install_binary_as(&binary, &default_bin_dir(), &asset.binary)
+}
+
+/// Choose the binary to install from extracted archive entries.
+///
+/// Rules, in order:
+/// 1. exact basename match to `expected`;
+/// 2. a single executable regular file whose basename is `expected` or starts
+///    with `expected-` / `expected_` (nested paths are fine);
+/// 3. a single executable regular file overall;
+/// 4. otherwise `None` (ambiguous or missing).
+///
+/// Directories and symlinks are never selected.
+pub fn locate_binary(extracted: &[PathBuf], expected: &str) -> Option<PathBuf> {
+    let regular: Vec<&PathBuf> = extracted
+        .iter()
+        .filter(|path| is_regular_file(path))
+        .collect();
+
+    if let Some(exact) = regular.iter().find(|path| basename(path) == expected) {
+        return Some((*exact).clone());
+    }
+
+    let dash = format!("{expected}-");
+    let underscore = format!("{expected}_");
+    let prefixed: Vec<&PathBuf> = regular
+        .iter()
+        .filter(|path| {
+            let name = basename(path);
+            name == expected || name.starts_with(&dash) || name.starts_with(&underscore)
+        })
+        .filter(|path| is_executable(path))
+        .copied()
+        .collect();
+
+    match prefixed.len() {
+        1 => return Some(prefixed[0].clone()),
+        n if n > 1 => return None,
+        _ => {}
+    }
+
+    let executables: Vec<&PathBuf> = regular
+        .iter()
+        .filter(|path| is_executable(path))
+        .copied()
+        .collect();
+    if executables.len() == 1 {
+        return Some(executables[0].clone());
+    }
+
+    None
+}
+
+fn basename(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// Verify a downloaded artifact against its pinned checksum.
@@ -466,5 +541,97 @@ mod tests {
         )
         .expect_err("missing pin");
         assert!(matches!(err, AppError::Integrity(_)));
+    }
+
+    fn make_file(path: &Path, executable: bool) -> PathBuf {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("parent");
+        }
+        fs::write(path, b"binary").expect("write");
+        let mode = if executable { 0o755 } else { 0o644 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+        path.to_path_buf()
+    }
+
+    #[test]
+    fn locates_versioned_root_binary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = make_file(&temp.path().join("qrypt-linux-amd64"), true);
+        assert_eq!(
+            locate_binary(std::slice::from_ref(&file), "qrypt"),
+            Some(file)
+        );
+    }
+
+    #[test]
+    fn locates_nested_versioned_binary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = make_file(
+            &temp.path().join("qrypt_0.7.0").join("qrypt-linux-arm64"),
+            true,
+        );
+        assert_eq!(
+            locate_binary(std::slice::from_ref(&file), "qrypt"),
+            Some(file)
+        );
+    }
+
+    #[test]
+    fn locates_exact_binary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = make_file(&temp.path().join("s3fs"), false);
+        assert_eq!(
+            locate_binary(std::slice::from_ref(&file), "s3fs"),
+            Some(file)
+        );
+    }
+
+    #[test]
+    fn exact_match_wins_over_ambiguity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exact = make_file(&temp.path().join("qrypt"), false);
+        let other = make_file(&temp.path().join("qrypt-other"), true);
+        let versioned = make_file(&temp.path().join("qrypt-linux-amd64"), true);
+        let found = locate_binary(&[other, versioned, exact.clone()], "qrypt");
+        assert_eq!(found, Some(exact));
+    }
+
+    #[test]
+    fn rejects_ambiguous_nonexact_candidates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = make_file(&temp.path().join("qrypt-other"), true);
+        let second = make_file(&temp.path().join("qrypt-linux-amd64"), true);
+        assert_eq!(locate_binary(&[first, second], "qrypt"), None);
+    }
+
+    #[test]
+    fn ignores_non_executable_prefixed_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = make_file(&temp.path().join("qrypt-linux-amd64"), false);
+        assert_eq!(locate_binary(&[file], "qrypt"), None);
+    }
+
+    #[test]
+    fn ignores_directories_and_symlinks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("qrypt");
+        fs::create_dir(&dir).expect("mkdir");
+        assert_eq!(locate_binary(&[dir], "qrypt"), None);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real = make_file(&temp.path().join("real-binary"), true);
+        let link = temp.path().join("qrypt");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert_eq!(locate_binary(&[link], "qrypt"), None);
+    }
+
+    #[test]
+    fn falls_back_to_single_executable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = make_file(&temp.path().join("some-random-binary"), true);
+        assert_eq!(
+            locate_binary(std::slice::from_ref(&file), "qrypt"),
+            Some(file)
+        );
     }
 }
