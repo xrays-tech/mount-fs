@@ -308,6 +308,9 @@ pub enum ProfileAction {
         /// Aliyun OpenAPI drive id.
         #[arg(long)]
         drive_id: Option<String>,
+        /// Aliyun drive type (aliyundrive-webdav): resource | backup | default.
+        #[arg(long)]
+        drive_type: Option<String>,
         /// Permit access by other users.
         #[arg(long)]
         allow_other: bool,

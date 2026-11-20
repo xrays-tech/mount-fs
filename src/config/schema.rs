@@ -50,6 +50,7 @@ engine_auto_fallback = true
 # engine = "qrypt"
 # mountpoint = "~/mnt/pan"
 # drive_id = "your-drive-id"
+# drive_type = "resource"   # aliyundrive-webdav only: resource | backup | default
 # credentials_ref = "~/.config/mount-fs/credentials/pan.token"
 
 [profiles]
@@ -147,6 +148,9 @@ pub struct Profile {
     /// Aliyun OpenAPI drive id (required by `qrypt`).
     #[serde(default)]
     pub drive_id: Option<String>,
+    /// Aliyun drive type for `aliyundrive-webdav` (`resource`, `backup`, `default`).
+    #[serde(default)]
+    pub drive_type: Option<String>,
     /// Aliyun OpenAPI client id (optional; webdav).
     #[serde(default)]
     pub client_id: Option<String>,
@@ -175,6 +179,7 @@ impl Profile {
             region: None,
             path_style: None,
             drive_id: None,
+            drive_type: None,
             client_id: None,
             client_secret: None,
             root_path: None,
@@ -277,6 +282,22 @@ pub fn default_config_path() -> Result<PathBuf> {
         .join(CONFIG_FILE_NAME))
 }
 
+/// Allowed Aliyun drive types (for `aliyundrive-webdav`).
+pub const DRIVE_TYPES: &[&str] = &["resource", "backup", "default"];
+
+/// Validate and normalize a drive type (case-insensitive, lowercase output).
+pub fn normalize_drive_type(value: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if DRIVE_TYPES.contains(&value.as_str()) {
+        Ok(value)
+    } else {
+        Err(AppError::Config(format!(
+            "invalid drive_type `{value}`; expected one of: {}",
+            DRIVE_TYPES.join(", ")
+        )))
+    }
+}
+
 /// Expand a leading `~` using the current user's home directory.
 pub fn expand_tilde(path: &Path) -> PathBuf {
     match etcetera::home_dir() {
@@ -376,6 +397,27 @@ options = { uid = 1000, gid = 1000, umask = "077", cache = "~/.cache/mount-fs/bu
             profile.options.cache.as_deref(),
             Some(expand_tilde(Path::new("~/.cache/mount-fs/bucket")).as_path())
         );
+    }
+
+    #[test]
+    fn parses_aliyun_drive_type() {
+        let config = Config::parse(
+            "[profiles.pan]\nprovider = \"aliyun\"\nmountpoint = \"/mnt/pan\"\ndrive_type = \"resource\"\n",
+        )
+        .expect("config");
+        let profile = config.profile("pan").expect("profile");
+        assert_eq!(profile.drive_type.as_deref(), Some("resource"));
+    }
+
+    #[test]
+    fn normalizes_drive_type() {
+        assert_eq!(
+            normalize_drive_type(" RESOURCE ").expect("valid"),
+            "resource"
+        );
+        assert_eq!(normalize_drive_type("Backup").expect("valid"), "backup");
+        assert_eq!(normalize_drive_type("default").expect("valid"), "default");
+        assert!(normalize_drive_type("bogus").is_err());
     }
 
     #[test]

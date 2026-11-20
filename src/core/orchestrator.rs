@@ -33,6 +33,8 @@ const MOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIDECAR_TIMEOUT: Duration = Duration::from_secs(10);
+const TERMINATION_GRACE: Duration = Duration::from_millis(500);
+const STEP_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct SidecarSpec {
     spec: CommandSpec,
@@ -45,6 +47,26 @@ fn to_command_spec(program: &Path, argv: &[String], env: &[(String, String)]) ->
         spec = spec.env(key.clone(), value.clone());
     }
     spec
+}
+
+fn profile_lock_path(profile: &str) -> Result<PathBuf> {
+    let dirs = creds::RuntimeDirs::resolve()?;
+    Ok(dirs.runtime.join(format!(
+        "mount-{}-{}.lock",
+        creds::sanitize_profile(profile),
+        creds::profile_nonce(profile)
+    )))
+}
+
+fn remove_profile_lock(profile: &str) {
+    let Ok(path) = profile_lock_path(profile) else {
+        return;
+    };
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(path = %path.display(), %err, "cannot remove mount lock"),
+    }
 }
 
 /// CLI overrides for a mount.
@@ -131,12 +153,7 @@ pub fn mount(
 
     // Hold a per-profile mount lock from before the idempotency check until the
     // state record is saved, so concurrent mounts cannot double-spawn an engine.
-    let lock_key = format!(
-        "{}-{}",
-        creds::sanitize_profile(&profile_name),
-        creds::profile_nonce(&profile_name)
-    );
-    let lock_path = dirs.runtime.join(format!("mount-{lock_key}.lock"));
+    let lock_path = profile_lock_path(&profile_name)?;
     let _mount_lock = match FileLock::try_acquire(&lock_path) {
         Ok(lock) => lock,
         Err(err) if err.kind() == ErrorKind::WouldBlock => {
@@ -603,13 +620,15 @@ pub fn umount(source: &dyn MountSource, target: &str, force: bool, all: bool) ->
 
     let registry = StateRegistry::load()?;
     if let Some(record) = find_record(&registry, target) {
-        unmount_record(source, &record, force)?;
         let profile = record.profile.clone();
-        state::update_registry(|registry| {
-            registry.remove(&profile);
-            Ok(())
-        })?;
-        return Ok(());
+        let result = unmount_record(source, &record, force);
+        if result.is_ok() {
+            state::update_registry(|registry| {
+                registry.remove(&profile);
+                Ok(())
+            })?;
+        }
+        return result;
     }
 
     // Not managed; allow unmounting an external FUSE mount by path.
@@ -672,52 +691,6 @@ fn umount_all(source: &dyn MountSource, force: bool) -> Result<()> {
             failures.join(", ")
         )))
     }
-}
-
-fn unmount_record(source: &dyn MountSource, record: &MountRecord, force: bool) -> Result<()> {
-    let rows = list(source)?;
-    let status = rows
-        .iter()
-        .find(|row| row.profile.as_deref() == Some(record.profile.as_str()))
-        .map(|row| row.status);
-
-    match status {
-        Some(MountStatus::Healthy) | Some(MountStatus::Hung) | Some(MountStatus::External) => {
-            unmount_path(source, &record.mountpoint, force)?;
-            println!("Unmounted {}", record.mountpoint.display());
-        }
-        Some(MountStatus::Stale) | Some(MountStatus::NotMounted) | None => {
-            println!(
-                "{} is not mounted; cleaning up state.",
-                record.mountpoint.display()
-            );
-        }
-    }
-
-    if let Some(pid) = record.pid {
-        if engine_alive(pid, record.starttime) {
-            process::terminate(pid);
-        }
-    }
-    for sidecar in &record.sidecars {
-        let alive = if sidecar.starttime == 0 {
-            process::pid_starttime(sidecar.pid).is_some()
-        } else {
-            process::is_alive(sidecar.pid, sidecar.starttime)
-        };
-        if alive {
-            process::terminate(sidecar.pid);
-        }
-    }
-    if record.engine == "aliyundrive-fuse" {
-        rotate_aliyun_token(record);
-    }
-    if let Some(path) = &record.credential_path {
-        if engine_credential_is_temp(&record.engine) {
-            creds::remove_artifact(path);
-        }
-    }
-    Ok(())
 }
 
 /// Persist a refresh token rewritten by `aliyundrive-fuse` back to
@@ -814,7 +787,182 @@ fn select_engine(
     )))
 }
 
-fn unmount_path(source: &dyn MountSource, mountpoint: &Path, force: bool) -> Result<()> {
+fn unmount_record(source: &dyn MountSource, record: &MountRecord, force: bool) -> Result<()> {
+    let rows = match list(source) {
+        Ok(rows) => rows,
+        Err(err) => {
+            // Even if we cannot inspect the mount table, never leave orphans.
+            cleanup_record(record);
+            return Err(err);
+        }
+    };
+    let status = rows
+        .iter()
+        .find(|row| row.profile.as_deref() == Some(record.profile.as_str()))
+        .map(|row| row.status);
+
+    let mounted = matches!(
+        status,
+        Some(MountStatus::Healthy) | Some(MountStatus::Hung) | Some(MountStatus::External)
+    );
+
+    let outcome = if mounted {
+        escalate_unmount(source, record, force)
+    } else {
+        println!(
+            "{} is not mounted; cleaning up state.",
+            record.mountpoint.display()
+        );
+        Ok(())
+    };
+
+    // Always clean up processes, credentials, and the per-profile lock.
+    cleanup_record(record);
+
+    if outcome.is_ok() && mounted {
+        println!("Unmounted {}", record.mountpoint.display());
+    }
+    outcome
+}
+
+/// Escalating unmount: fusermount -> SIGTERM main -> SIGTERM sidecars ->
+/// (with `--force`) lazy unmount + SIGKILL. Succeeds as soon as the mount is gone.
+fn escalate_unmount(source: &dyn MountSource, record: &MountRecord, force: bool) -> Result<()> {
+    let mountpoint = record.mountpoint.as_path();
+    if mount_absent(source, mountpoint) {
+        return Ok(());
+    }
+    let deadline = Instant::now() + UNMOUNT_TIMEOUT;
+    let step = |overall: Instant| std::cmp::min(overall, Instant::now() + STEP_TIMEOUT);
+
+    // (a) fusermount3 (lazy when forced).
+    run_fusermount(mountpoint, force);
+    if wait_mount_absent(source, mountpoint, step(deadline)) {
+        return Ok(());
+    }
+
+    // (b) SIGTERM the main engine (rclone/qrypt/s3fs unmount on exit).
+    if let Some(pid) = record.pid {
+        if engine_alive(pid, record.starttime) {
+            process::terminate(pid);
+        }
+    }
+    if wait_mount_absent(source, mountpoint, step(deadline)) {
+        return Ok(());
+    }
+
+    // (c) SIGTERM sidecars.
+    for sidecar in &record.sidecars {
+        if sidecar_alive(sidecar) {
+            process::terminate(sidecar.pid);
+        }
+    }
+    if wait_mount_absent(source, mountpoint, step(deadline)) {
+        return Ok(());
+    }
+
+    // (d) forced escalation: lazy unmount + SIGKILL after a short grace.
+    if force {
+        run_fusermount(mountpoint, true);
+        let grace_deadline = std::cmp::min(deadline, Instant::now() + TERMINATION_GRACE);
+        if wait_mount_absent(source, mountpoint, grace_deadline) {
+            return Ok(());
+        }
+        if let Some(pid) = record.pid {
+            if engine_alive(pid, record.starttime) {
+                process::terminate_force(pid);
+            }
+        }
+        for sidecar in &record.sidecars {
+            if sidecar_alive(sidecar) {
+                process::terminate_force(sidecar.pid);
+            }
+        }
+        if wait_mount_absent(source, mountpoint, deadline) {
+            return Ok(());
+        }
+    }
+
+    let hint = if force {
+        "mountpoint is still present after a lazy unmount and SIGKILL"
+    } else {
+        "mountpoint is still present; retry with --force"
+    };
+    Err(AppError::Unsupported(format!(
+        "failed to unmount {}: {hint}",
+        mountpoint.display()
+    )))
+}
+
+/// Best-effort cleanup of everything associated with a mount record.
+fn cleanup_record(record: &MountRecord) {
+    if let Some(pid) = record.pid {
+        ensure_process_dead(pid, record.starttime);
+    }
+    for sidecar in &record.sidecars {
+        let starttime = if sidecar.starttime == 0 {
+            None
+        } else {
+            Some(sidecar.starttime)
+        };
+        ensure_process_dead(sidecar.pid, starttime);
+    }
+
+    if record.engine == "aliyundrive-fuse" {
+        rotate_aliyun_token(record);
+    }
+    if let Some(path) = &record.credential_path {
+        if engine_credential_is_temp(&record.engine) {
+            creds::remove_artifact(path);
+        }
+    }
+    remove_profile_lock(&record.profile);
+}
+
+fn ensure_process_dead(pid: u32, starttime: Option<u64>) {
+    if !engine_alive(pid, starttime) {
+        return;
+    }
+    process::terminate(pid);
+    if process::wait_for_exit(pid, starttime, TERMINATION_GRACE) {
+        return;
+    }
+    process::terminate_force(pid);
+    let _ = process::wait_for_exit(pid, starttime, TERMINATION_GRACE);
+}
+
+fn sidecar_alive(sidecar: &PidRecord) -> bool {
+    if sidecar.starttime == 0 {
+        process::pid_running(sidecar.pid)
+    } else {
+        process::is_alive(sidecar.pid, sidecar.starttime)
+    }
+}
+
+fn mount_absent(source: &dyn MountSource, mountpoint: &Path) -> bool {
+    source
+        .list()
+        .map(|mounts| {
+            !mounts
+                .iter()
+                .any(|mount| mount.target.as_path() == mountpoint)
+        })
+        .unwrap_or(false)
+}
+
+fn wait_mount_absent(source: &dyn MountSource, mountpoint: &Path, deadline: Instant) -> bool {
+    loop {
+        if mount_absent(source, mountpoint) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn run_fusermount(mountpoint: &Path, force: bool) {
     let program = fuse::fusermount3_path().unwrap_or_else(|| PathBuf::from("fusermount3"));
     let mut command = Command::new(program);
     if force {
@@ -824,41 +972,32 @@ fn unmount_path(source: &dyn MountSource, mountpoint: &Path, force: bool) -> Res
     }
     command.arg(mountpoint);
 
-    let output = command.output()?;
-    if !output.status.success() {
-        tracing::debug!(
+    match command.output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => tracing::debug!(
             status = %output.status,
             stderr = %String::from_utf8_lossy(&output.stderr),
-            "fusermount3 returned non-zero; confirming mount state"
-        );
+            "fusermount3 returned non-zero; escalating"
+        ),
+        Err(err) => tracing::debug!(%err, "cannot run fusermount3; escalating"),
     }
+}
 
+fn unmount_path(source: &dyn MountSource, mountpoint: &Path, force: bool) -> Result<()> {
     let deadline = Instant::now() + UNMOUNT_TIMEOUT;
-    loop {
-        let present = source
-            .list()
-            .map(|mounts| {
-                mounts
-                    .iter()
-                    .any(|mount| mount.target.as_path() == mountpoint)
-            })
-            .unwrap_or(false);
-        if !present {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            let hint = if force {
-                "mountpoint is still present after a lazy unmount"
-            } else {
-                "mountpoint is still present; retry with --force"
-            };
-            return Err(AppError::Unsupported(format!(
-                "failed to unmount {}: {hint}",
-                mountpoint.display()
-            )));
-        }
-        thread::sleep(POLL_INTERVAL);
+    run_fusermount(mountpoint, force);
+    if wait_mount_absent(source, mountpoint, deadline) {
+        return Ok(());
     }
+    let hint = if force {
+        "mountpoint is still present after a lazy unmount"
+    } else {
+        "mountpoint is still present; retry with --force"
+    };
+    Err(AppError::Unsupported(format!(
+        "failed to unmount {}: {hint}",
+        mountpoint.display()
+    )))
 }
 
 fn find_record(registry: &StateRegistry, target: &str) -> Option<MountRecord> {
@@ -1030,6 +1169,7 @@ fn resolve_profile(
             region: None,
             path_style: Some(true),
             drive_id: None,
+            drive_type: None,
             client_id: None,
             client_secret: None,
             root_path: None,

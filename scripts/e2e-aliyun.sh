@@ -13,12 +13,14 @@
 #   - the selected engine installed (and `rclone` for webdav)
 #   - ALIYUN_REFRESH_TOKEN in the environment (secret; never placed in argv)
 #   - ALIYUN_DRIVE_ID only for qrypt
+#   - ALIYUN_DRIVE_TYPE only for aliyundrive-webdav: resource | backup | default
+#     (`resource` mounts the Resource Library / 资源库, `backup` the Backup drive)
 #
 # Obtaining the token (QR, no drive_id -> use webdav):
 #   mount-fs config profile add aliyun --provider aliyun --engine aliyundrive-webdav --mountpoint ~/mnt/aliyun
 #   mount-fs config login aliyun --profile aliyun --qr          # scan the QR
 #   export ALIYUN_REFRESH_TOKEN="$(cat ~/.config/mount-fs/credentials/aliyun.token)"
-#   ALIYUN_ENGINE=aliyundrive-webdav scripts/e2e-aliyun.sh
+#   ALIYUN_ENGINE=aliyundrive-webdav ALIYUN_DRIVE_TYPE=resource scripts/e2e-aliyun.sh
 #
 # This script is NOT run by `cargo test`.
 #
@@ -103,8 +105,15 @@ export QRYPT_HOME="$TMP/qrypt"
 mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$QRYPT_HOME" "$MNT"
 
 # --- configure profile + store token (token via stdin, never argv) ---------
+if [[ -n "${ALIYUN_DRIVE_TYPE:-}" && "$ENGINE" != "aliyundrive-webdav" ]]; then
+    echo "Ignoring ALIYUN_DRIVE_TYPE ($ALIYUN_DRIVE_TYPE): only aliyundrive-webdav supports it."
+fi
+
 ADD_ARGS=(config profile add "$PROFILE" --provider aliyun --engine "$ENGINE" --mountpoint "$MNT")
 [[ -n "${ALIYUN_DRIVE_ID:-}" ]] && ADD_ARGS+=(--drive-id "$ALIYUN_DRIVE_ID")
+if [[ "$ENGINE" == "aliyundrive-webdav" && -n "${ALIYUN_DRIVE_TYPE:-}" ]]; then
+    ADD_ARGS+=(--drive-type "$ALIYUN_DRIVE_TYPE")
+fi
 "$MOUNT_FS" --config "$CFG" "${ADD_ARGS[@]}"
 
 LOGIN_ARGS=(config login aliyun --profile "$PROFILE")

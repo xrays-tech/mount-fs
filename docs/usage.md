@@ -266,6 +266,14 @@ QR is printed by the upstream tool; mount-fs stops echoing before the
 `refresh_token:` block so the token is never shown or logged, then stores it in
 a `0600` credential file and sets the profile's `credentials_ref`.
 
+`--drive-type` selects which Aliyun drive the webdav engine mounts:
+`resource` (资源库 / Resource Library), `backup` (备份盘 / Backup drive), or
+`default` (the account default). It applies only to `aliyundrive-webdav`:
+
+```sh
+mount-fs config profile add aliyun --provider aliyun --engine aliyundrive-webdav   --mountpoint ~/mnt/aliyun --drive-type resource
+```
+
 > QR login yields an **OpenAPI** refresh token. It is not usable with
 > `aliyundrive-fuse` (legacy web token) or with `qrypt` unless you also supply
 > the matching `drive_id`.

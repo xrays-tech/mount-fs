@@ -353,6 +353,7 @@ fn test_profile() -> Profile {
         region: Some("us-east-1".to_string()),
         path_style: Some(true),
         drive_id: None,
+        drive_type: None,
         client_id: None,
         client_secret: None,
         root_path: None,

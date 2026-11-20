@@ -32,6 +32,12 @@ impl Provider for S3Provider {
                 profile.provider
             )));
         }
+        if profile.drive_type.is_some() {
+            return Err(AppError::Config(
+                "`drive_type` is only supported for Aliyun profiles".to_string(),
+            ));
+        }
+
         match profile.bucket.as_deref() {
             Some(bucket) if !bucket.is_empty() => {}
             _ => {
@@ -92,6 +98,7 @@ mod tests {
             region: None,
             path_style: None,
             drive_id: None,
+            drive_type: None,
             client_id: None,
             client_secret: None,
             root_path: None,
@@ -141,6 +148,14 @@ mod tests {
         p.endpoint = Some("https://s3.amazonaws.com".to_string());
         p.region = None;
         assert!(provider.validate(&p).is_ok());
+    }
+
+    #[test]
+    fn rejects_drive_type_on_s3() {
+        let provider = S3Provider::new();
+        let mut p = profile(None, Some("mybucket"));
+        p.drive_type = Some("resource".to_string());
+        assert!(provider.validate(&p).is_err());
     }
 
     #[test]

@@ -40,6 +40,7 @@ fn s3_profile() -> NewProfile {
         region: Some("r".to_string()),
         path_style: true,
         drive_id: None,
+        drive_type: None,
         allow_other: false,
         read_only: false,
     }

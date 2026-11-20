@@ -5,6 +5,8 @@ use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// A description of a command to execute.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +105,33 @@ pub fn spawn_background_child(spec: &CommandSpec, log_path: &Path) -> io::Result
 pub fn terminate(pid: u32) {
     if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
         let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+    }
+}
+
+/// Send `SIGKILL` to `pid`, ignoring errors (best effort).
+pub fn terminate_force(pid: u32) {
+    if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+}
+
+/// Wait until `pid` exits, optionally guarding against PID reuse.
+///
+/// Returns `true` if the process is gone by the deadline.
+pub fn wait_for_exit(pid: u32, expected_starttime: Option<u64>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let alive = match expected_starttime {
+            Some(starttime) => is_alive(pid, starttime),
+            None => pid_running(pid),
+        };
+        if !alive {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

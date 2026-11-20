@@ -5,6 +5,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use fs4::fs_std::FileExt;
@@ -68,7 +69,9 @@ fn open_lock_file(path: &Path) -> io::Result<(File, PathBuf)> {
         .read(true)
         .write(true)
         .truncate(false)
+        .mode(0o600)
         .open(path)?;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     Ok((file, path.to_path_buf()))
 }
 
@@ -107,6 +110,8 @@ mod tests {
         let lock = FileLock::acquire(&path).expect("acquire with parents");
         assert!(path.exists());
         assert_eq!(lock.path(), path.as_path());
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         drop(lock);
         let _ = fs::remove_dir_all(&dir);
     }

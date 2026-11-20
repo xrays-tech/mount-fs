@@ -29,6 +29,8 @@ pub struct NewProfile {
     pub path_style: bool,
     /// Aliyun drive id.
     pub drive_id: Option<String>,
+    /// Aliyun drive type (webdav): resource | backup | default.
+    pub drive_type: Option<String>,
     /// `allow_other`.
     pub allow_other: bool,
     /// Read-only mount.
@@ -111,6 +113,10 @@ fn build_profile(new: &NewProfile) -> Result<Profile> {
             None
         },
         drive_id: new.drive_id.clone(),
+        drive_type: match &new.drive_type {
+            Some(value) => Some(crate::config::normalize_drive_type(value)?),
+            None => None,
+        },
         client_id: None,
         client_secret: None,
         root_path: None,
@@ -169,6 +175,12 @@ pub fn set_profile_fields(config_path: &Path, name: &str, assignments: &[String]
             "endpoint" => profile.endpoint = non_empty(value),
             "region" => profile.region = non_empty(value),
             "drive_id" => profile.drive_id = non_empty(value),
+            "drive_type" => {
+                profile.drive_type = match non_empty(value) {
+                    Some(value) => Some(crate::config::normalize_drive_type(&value)?),
+                    None => None,
+                }
+            }
             "client_id" => profile.client_id = non_empty(value),
             "root_path" => profile.root_path = non_empty(value),
             "path_style" => profile.path_style = Some(parse_bool(value)?),
@@ -239,6 +251,7 @@ fn profile_value(profile: &Profile, field: &str) -> Result<String> {
             .map(|value| value.to_string())
             .unwrap_or_default(),
         "drive_id" => profile.drive_id.clone().unwrap_or_default(),
+        "drive_type" => profile.drive_type.clone().unwrap_or_default(),
         "client_id" => profile.client_id.clone().unwrap_or_default(),
         "client_secret" => profile.client_secret.clone().unwrap_or_default(),
         "root_path" => profile.root_path.clone().unwrap_or_default(),
@@ -322,6 +335,7 @@ pub fn render_config(config: &Config, name: Option<&str>) -> Result<String> {
                     .unwrap_or_default(),
             ),
             ("drive_id", profile.drive_id.clone().unwrap_or_default()),
+            ("drive_type", profile.drive_type.clone().unwrap_or_default()),
             ("client_id", profile.client_id.clone().unwrap_or_default()),
             (
                 "client_secret",

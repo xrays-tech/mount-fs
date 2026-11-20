@@ -64,7 +64,8 @@ impl AliyundriveWebdavEngine {
         port: u16,
         read_only: bool,
         root: Option<&str>,
-    ) -> Vec<String> {
+        drive_type: Option<&str>,
+    ) -> Result<Vec<String>> {
         let mut argv = vec![
             "--host".to_string(),
             "127.0.0.1".to_string(),
@@ -80,7 +81,12 @@ impl AliyundriveWebdavEngine {
             argv.push("--root".to_string());
             argv.push(root.to_string());
         }
-        argv
+        if let Some(drive_type) = drive_type {
+            let drive_type = crate::config::normalize_drive_type(drive_type)?;
+            argv.push("--drive-type".to_string());
+            argv.push(drive_type);
+        }
+        Ok(argv)
     }
 
     /// `rclone mount` argv (pure).
@@ -281,7 +287,8 @@ impl Engine for AliyundriveWebdavEngine {
                         port,
                         effective.read_only,
                         profile.root_path.as_deref(),
-                    ),
+                        profile.drive_type.as_deref(),
+                    )?,
                     env: server_env,
                     readiness: Readiness::TcpPort(port),
                 }],
@@ -306,12 +313,54 @@ mod tests {
             12345,
             true,
             Some("/drive/root"),
-        );
+            None,
+        )
+        .expect("argv");
         assert!(argv.contains(&"127.0.0.1".to_string()));
         assert!(argv.contains(&"12345".to_string()));
         assert!(argv.contains(&"--read-only".to_string()));
         assert!(argv.contains(&"/drive/root".to_string()));
         assert!(!argv.iter().any(|arg| arg.contains("REFRESH")));
+    }
+
+    #[test]
+    fn server_argv_includes_drive_type_when_set() {
+        let argv = AliyundriveWebdavEngine::server_argv(
+            Path::new("/run/user/1000/mount-fs/webdav-pan"),
+            12345,
+            false,
+            None,
+            Some("RESOURCE"),
+        )
+        .expect("argv");
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["--drive-type", "resource"]));
+    }
+
+    #[test]
+    fn server_argv_omits_drive_type_when_unset() {
+        let argv = AliyundriveWebdavEngine::server_argv(
+            Path::new("/run/user/1000/mount-fs/webdav-pan"),
+            12345,
+            false,
+            None,
+            None,
+        )
+        .expect("argv");
+        assert!(!argv.iter().any(|arg| arg == "--drive-type"));
+    }
+
+    #[test]
+    fn server_argv_rejects_invalid_drive_type() {
+        assert!(AliyundriveWebdavEngine::server_argv(
+            Path::new("/run/user/1000/mount-fs/webdav-pan"),
+            12345,
+            false,
+            None,
+            Some("bogus"),
+        )
+        .is_err());
     }
 
     #[test]

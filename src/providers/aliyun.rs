@@ -43,6 +43,10 @@ impl Provider for AliyunProvider {
             )));
         }
 
+        if let Some(drive_type) = &profile.drive_type {
+            crate::config::normalize_drive_type(drive_type)?;
+        }
+
         let Some(engine_id) = profile.engine.as_deref() else {
             // Engine selection happens later; variant-specific checks below.
             return Ok(());
@@ -136,6 +140,7 @@ mod tests {
             region: None,
             path_style: None,
             drive_id: drive_id.map(str::to_string),
+            drive_type: None,
             client_id: None,
             client_secret: None,
             root_path: None,
@@ -155,6 +160,19 @@ mod tests {
         with_token.credentials_ref = Some(token_file);
         // No drive_id yet: allowed (prompted/validated at plan time).
         assert!(provider.validate(&with_token).is_ok());
+    }
+
+    #[test]
+    fn validates_and_normalizes_drive_type() {
+        let provider = AliyunProvider::new();
+        let mut valid = profile(None, None);
+        valid.drive_type = Some("BACKUP".to_string());
+        assert!(provider.validate(&valid).is_ok());
+
+        let mut invalid = profile(None, None);
+        invalid.drive_type = Some("bogus".to_string());
+        let err = provider.validate(&invalid).expect_err("invalid drive type");
+        assert!(err.to_string().contains("drive_type"), "{err}");
     }
 
     #[test]
