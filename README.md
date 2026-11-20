@@ -1,117 +1,77 @@
 # mount-fs
 
 `mount-fs` is a Linux command-line tool for mounting cloud drives — Aliyun
-Drive and S3-compatible object storage — by orchestrating existing FUSE tools
-such as `s3fs-fuse`, `aliyundrive-fuse`, and `qrypt`.
+Drive and S3-compatible object storage — on the local filesystem by
+orchestrating existing FUSE tools (`s3fs-fuse`, `aliyundrive-fuse`, `qrypt`,
+`aliyundrive-webdav`).
 
 Rather than reimplementing cloud storage clients, `mount-fs` manages their
-installation, configuration, and lifecycle behind a single consistent CLI.
+detection, installation, configuration, and lifecycle behind one consistent
+CLI. It also detects and installs missing runtime dependencies (FUSE 3,
+`rclone`, …) either explicitly or on demand while mounting.
 
 ## Status
 
-**M6 — release-ready.** The S3 and Aliyun providers are usable end to end:
-environment diagnostics (`doctor`, including a safe `--fix`), engine detection
-and installation (`providers`, `install`), profile and credential management
-(`config ...`), the mount lifecycle (`mount`, `umount`, `list`, `status`,
-`logs`), systemd user-service generation (`service ...`) for persistent mounts,
-cross-distro CI, and source/release archive packaging.
+Both providers are usable end to end:
+
+- **S3** via `s3fs-fuse` (AWS S3, MinIO, Ceph RGW, Aliyun OSS, …).
+- **Aliyun Drive** via `aliyundrive-webdav` (QR/OpenAPI token, read/write, no
+  `drive_id`), `qrypt` (OpenAPI token + `drive_id`, read/write), or
+  `aliyundrive-fuse` (legacy web token, read-only).
+
+Environment diagnostics (`doctor`, safe `doctor --fix`), engine and dependency
+installation (`providers`, `install`, `deps`), profile and credential
+management (`config ...`), the mount lifecycle (`mount`, `umount`, `list`,
+`status`, `logs`), systemd user-service generation (`service ...`) for
+persistent mounts, and source/release packaging are all implemented and tested.
 
 Secrets are never accepted through `mount-fs`'s own argv: they come from
-stdin/interactive prompts and are stored in `0600` credential files referenced
-by a profile's `credentials_ref`.
+stdin/interactive prompts (or a pre-existing `0600` file) and are referenced by
+a profile's `credentials_ref`.
 
-## Documentation
+## Supported drives and engines
 
-- [Usage guide](docs/usage.md) — quickstart, S3 and Aliyun profiles, mounting,
-  persistent services, and the end-to-end smoke test.
-- [Troubleshooting](docs/troubleshooting.md) — installation, FUSE permission
-  errors, stale mounts, Aliyun tokens, credentials, and systemd environment
-  issues.
+| Provider | Engine | Read/write | Credential | Notes |
+| --- | --- | --- | --- | --- |
+| S3 | `s3fs-fuse` | r/w | access key + secret | Packaged in Fedora/RHEL (EPEL); non-AWS endpoints use `url`, path-style and `region`/`sigv4`. |
+| Aliyun | `aliyundrive-webdav` | r/w | OpenAPI refresh token | Two-process bridge: loopback WebDAV server + `rclone mount`. No `drive_id`; supports `drive_type`. |
+| Aliyun | `qrypt` | r/w | OpenAPI refresh token + `drive_id` | Single process, foreground FUSE 3 mount. |
+| Aliyun | `aliyundrive-fuse` | read-only | legacy web refresh token | Archived upstream; no `drive_id`. |
 
-## Capabilities
-
-- Detect, install, and uninstall supported mount engines and their runtime
-  dependencies (`install`, `deps`, `uninstall`, `providers`).
-- Configure providers and credentials (`config init|list|get|set|login|logout`).
-- Manually invoked and unattended mounts (`mount`, `umount`, `list`,
-  `status`, `logs`, `service`).
-- Preflight host diagnostics (`doctor`).
-
-## Persistent mounts (systemd)
-
-Generate a user `.service` for a profile (credentials must live in a persistent
-`0600` `credentials_ref`, not `$XDG_RUNTIME_DIR`):
-
-```sh
-mount-fs service generate bucket
-systemctl --user daemon-reload
-systemctl --user enable --now mount-fs-bucket.service
-```
-
-`mount-fs service list [--json]` lists generated units and
-`mount-fs service remove bucket` deletes one. The unit uses
-`ExecStopPost=-fusermount3 -u <mountpoint>` so an already-unmounted target does
-not fail the unit.
-
-## End-to-end test
-
-On a host with FUSE and `rclone`/`s3fs`, run the self-contained S3 smoke test:
-
-```sh
-scripts/e2e-s3.sh
-```
-
-It prints `SKIP:` with a reason when FUSE mounting is unavailable.
+Use `mount-fs providers` to see which engines are installed and each engine's
+`token_kind` and capabilities.
 
 ## Requirements
 
-- Linux with FUSE support (`/dev/fuse`).
+- Linux with FUSE 3 (`/dev/fuse`, `fusermount3`).
 - Rust 1.85 or newer to build from source.
 
-## Build
+Runtime dependencies such as `fuse3` and `rclone` (for the webdav bridge) are
+detected by `mount-fs deps` and can be installed automatically.
+
+## Build and install
 
 ```sh
 cargo build --release --locked
+install -m 0755 target/release/mount-fs ~/.local/bin/mount-fs
 ```
 
-The binary is written to `target/release/mount-fs`.
-
-## Packaging
-
-Build a self-contained source/binary archive (binary, README, LICENSE,
-`dev-docs/`, and user documentation) plus its sha256 checksum:
+### Packaging
 
 ```sh
 bash scripts/package.sh --locked
 ```
 
-Artifacts are written to `dist/mount-fs-<version>-<target>.tar.gz` and
-`dist/mount-fs-<version>-<target>.tar.gz.sha256`. Tagged builds (`v*`) run the
-same script in `.github/workflows/release.yml` and attach the archives to a
-GitHub Release. Builds for `x86_64-unknown-linux-gnu` are authoritative; the
-`aarch64-unknown-linux-gnu` cross build is best-effort.
+This writes `dist/mount-fs-<version>-<target>.tar.gz` and a `.sha256` checksum
+(binary, README, LICENSE, `dev-docs/`, and user docs). Tagged builds (`v*`) run
+the same script in `.github/workflows/release.yml` and attach the archives to a
+GitHub Release.
 
-Install from a release archive with:
+## Quick start
 
-```sh
-tar xzf mount-fs-<version>-<target>.tar.gz
-install -m 0755 mount-fs-<version>-<target>/mount-fs ~/.local/bin/mount-fs
-```
-
-## Run
+### S3 with `s3fs-fuse`
 
 ```sh
-# Show usage
-./target/release/mount-fs --help
-
-# Run host diagnostics
-./target/release/mount-fs doctor
-```
-
-### Create a profile and log in
-
-```sh
-# Add an S3 profile
 mount-fs config profile add bucket \
   --provider s3 \
   --engine s3fs-fuse \
@@ -121,14 +81,110 @@ mount-fs config profile add bucket \
   --region us-east-1 \
   --path-style
 
-# Store credentials (prompted on stdin; never via argv)
+# Credentials are read from stdin and stored in a 0600 file (never argv).
 mount-fs config login s3 --profile bucket
-
-# Inspect / validate / mount
-mount-fs config show bucket
-mount-fs config validate bucket
 mount-fs mount bucket
 ```
+
+### Aliyun Drive with the QR flow (webdav, no `drive_id`)
+
+```sh
+mount-fs config profile add aliyun \
+  --provider aliyun \
+  --engine aliyundrive-webdav \
+  --mountpoint ~/mnt/aliyun \
+  --drive-type resource          # resource (资源库) | backup (备份盘) | default
+
+# Opens the QR login in your terminal and stores the token (never printed).
+mount-fs config login aliyun --profile aliyun --qr
+mount-fs mount aliyun
+```
+
+### Aliyun Drive with `qrypt` (read/write, needs `drive_id`)
+
+```sh
+mount-fs config profile add pan \
+  --provider aliyun \
+  --engine qrypt \
+  --mountpoint ~/mnt/pan \
+  --drive-id <DRIVE_ID>
+
+# qrypt has no interactive login: provide the OpenAPI refresh token on stdin.
+mount-fs config login aliyun --profile pan
+mount-fs mount pan
+```
+
+`aliyundrive-fuse` (read-only, legacy web token) is also selectable with
+`--engine aliyundrive-fuse`.
+
+## Dependency management
+
+```sh
+mount-fs doctor                     # environment + dependency status
+mount-fs deps                       # /dev/fuse, fusermount3, rclone, ...
+mount-fs deps install --engine aliyundrive-webdav   # install missing packages
+mount-fs install s3fs-fuse --no-deps                 # engine only, skip deps
+```
+
+`mount --auto-install` (or `general.auto_install = true`) installs a missing
+engine and its runtime dependencies before mounting. Auto-install never compiles
+from source, and `--dry-run` prints the exact install plan without changing the
+system.
+
+## Mount lifecycle
+
+- `mount <profile>` is idempotent: an already-mounted profile is a no-op.
+- `umount <profile|path>` unmounts and cleans state/credentials; `--force`
+  escalates (lazy unmount, process termination) for stuck mounts.
+- Stale/broken FUSE mountpoints left by a crash are detected and lazy-unmounted
+  before a new mount.
+- `list`, `status [--json]`, and `logs [--follow]` inspect managed mounts.
+
+## Persistent mounts (systemd)
+
+Generate a user `.service` for a profile (credentials must live in a persistent
+`0600` `credentials_ref`, not `$XDG_RUNTIME_DIR`):
+
+```sh
+mount-fs service generate aliyun
+systemctl --user daemon-reload
+systemctl --user enable --now mount-fs-aliyun.service
+```
+
+`mount-fs service list [--json]` lists generated units and
+`mount-fs service remove aliyun` deletes one. The unit uses
+`ExecStopPost=-fusermount3 -u <mountpoint>` and start limiting so a broken mount
+does not restart forever. To mount before login, enable lingering:
+`sudo loginctl enable-linger "$USER"`.
+
+## Security
+
+- Secrets are never passed through `mount-fs`'s argv; `config get`/`config show`
+  redact secret values.
+- Credentials are stored in `0600` files (backend files are `0700`), and
+  temporary credential artifacts are removed on unmount and swept on startup.
+- Release archives are verified against pinned SHA-256 checksums before install.
+
+## End-to-end tests
+
+On a host with FUSE (and the relevant engines), run a self-contained test:
+
+```sh
+scripts/e2e-s3.sh        # rclone-served S3 + s3fs-fuse
+scripts/e2e-aliyun.sh    # Aliyun; ALIYUN_ENGINE=aliyundrive-webdav|qrypt
+```
+
+They print `SKIP:` with a reason when FUSE mounting is unavailable. The Aliyun
+script reads `ALIYUN_REFRESH_TOKEN` (and `ALIYUN_DRIVE_ID` for qrypt) from the
+environment; tokens are never placed in argv.
+
+## Documentation
+
+- [Usage guide](docs/usage.md) — quickstart, S3 and Aliyun profiles, mounting,
+  persistent services, and the end-to-end smoke tests.
+- [Troubleshooting](docs/troubleshooting.md) — installation, FUSE permission
+  errors, stale mounts, Aliyun tokens, credentials, and systemd environment
+  issues.
 
 ## Development
 
