@@ -13,6 +13,9 @@ pub mod pkg;
 pub mod privilege;
 pub mod process;
 pub mod supervisor;
+pub mod systemd;
+
+use std::path::Path;
 
 use crate::error::Result;
 use crate::system::distro::DistroFamily;
@@ -20,14 +23,33 @@ use crate::system::pkg::PackageManager;
 use crate::system::privilege::Escalation;
 
 /// Run the `doctor` report, printing one `[ OK ]`/`[WARN]` line per check.
-pub fn doctor() -> Result<()> {
+pub fn doctor(fix: bool) -> Result<()> {
     let distro = distro::detect();
     report_distro(&distro);
     report_package_manager(distro.family);
     report_fuse();
     report_privilege();
     report_fuse_mounts();
+
+    if fix {
+        apply_fuse_fix();
+    }
     Ok(())
+}
+
+/// Safe, minimal `doctor --fix`: only touches `/etc/fuse.conf`.
+fn apply_fuse_fix() {
+    let action = fuse::fuse_conf_fix_action(fuse::user_allow_other_set(), privilege::is_root());
+    match action {
+        fuse::FuseConfFix::None => println!("[ OK ] fuse.conf: user_allow_other already enabled"),
+        fuse::FuseConfFix::Append => match fuse::append_user_allow_other(Path::new(fuse::FUSE_CONF)) {
+            Ok(()) => println!("[ OK ] fuse.conf: appended user_allow_other"),
+            Err(err) => println!("[WARN] fuse.conf: could not append user_allow_other ({err})"),
+        },
+        fuse::FuseConfFix::SuggestCommand => println!(
+            "[WARN] fuse.conf: user_allow_other missing; run:\n  sudo sh -c 'echo user_allow_other >> /etc/fuse.conf'"
+        ),
+    }
 }
 
 fn report_distro(distro: &distro::Distro) {

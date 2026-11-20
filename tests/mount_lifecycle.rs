@@ -527,6 +527,16 @@ bucket = "ext"
 
     let json = orchestrator::json_list(&rows).expect("json");
     assert!(json.contains("\"not-mounted\""), "json: {json}");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("list JSON parses");
+    assert!(parsed.is_array(), "list JSON must be an array");
+
+    let status_row = rows
+        .iter()
+        .find(|row| row.profile.as_deref() == Some("app"))
+        .expect("app row");
+    let status_json = orchestrator::json_status(status_row).expect("status json");
+    let parsed: serde_json::Value = serde_json::from_str(&status_json).expect("status JSON parses");
+    assert!(parsed.is_object(), "status JSON must be an object");
 }
 
 #[test]

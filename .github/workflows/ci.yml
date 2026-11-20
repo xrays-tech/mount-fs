@@ -54,3 +54,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  fedora:
+    name: Fedora (container)
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install system packages
+        run: >
+          dnf install -y
+          git gcc make pkg-config ca-certificates
+          fuse3 fuse3-devel
+          s3fs-fuse
+          xz-devel
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the hermetic test suite
+        run: cargo test --locked
+
+  debian:
+    name: Debian (container)
+    runs-on: ubuntu-latest
+    container: debian:stable-slim
+    steps:
+      - name: Install system packages
+        run: >
+          apt-get update &&
+          apt-get install -y --no-install-recommends
+          ca-certificates git build-essential pkg-config
+          fuse3 libfuse3-dev
+          liblzma-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the hermetic test suite
+        run: cargo test --locked

@@ -1,6 +1,7 @@
 //! FUSE probing and `/proc/self/mountinfo` parsing.
 
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Path to the FUSE device.
@@ -53,6 +54,41 @@ pub fn parse_fuse_conf(contents: &str) -> bool {
         let line = line.split('#').next().unwrap_or("").trim();
         line == "user_allow_other"
     })
+}
+
+/// Action for `doctor --fix` regarding `user_allow_other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuseConfFix {
+    /// Nothing to do.
+    None,
+    /// Running as root: append the directive.
+    Append,
+    /// Not root: print the command the user must run.
+    SuggestCommand,
+}
+
+/// Decide what `doctor --fix` should do (pure).
+pub fn fuse_conf_fix_action(current: Option<bool>, is_root: bool) -> FuseConfFix {
+    if current == Some(true) {
+        return FuseConfFix::None;
+    }
+    if is_root {
+        FuseConfFix::Append
+    } else {
+        FuseConfFix::SuggestCommand
+    }
+}
+
+/// Append `user_allow_other` to a fuse.conf file (root only).
+pub fn append_user_allow_other(path: &Path) -> io::Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let prefix = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{prefix}user_allow_other")
 }
 
 /// Whether a filesystem type string denotes a FUSE mount.
@@ -222,6 +258,32 @@ mod tests {
         assert!(parse_fuse_conf("user_allow_other # inline"));
         assert!(!parse_fuse_conf("# user_allow_other\nmount_max = 1000\n"));
         assert!(!parse_fuse_conf(""));
+    }
+
+    #[test]
+    fn fix_action_decisions() {
+        assert_eq!(fuse_conf_fix_action(Some(true), false), FuseConfFix::None);
+        assert_eq!(fuse_conf_fix_action(Some(false), true), FuseConfFix::Append);
+        assert_eq!(fuse_conf_fix_action(None, true), FuseConfFix::Append);
+        assert_eq!(
+            fuse_conf_fix_action(Some(false), false),
+            FuseConfFix::SuggestCommand
+        );
+        assert_eq!(
+            fuse_conf_fix_action(None, false),
+            FuseConfFix::SuggestCommand
+        );
+    }
+
+    #[test]
+    fn append_adds_directive_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("fuse.conf");
+        std::fs::write(&path, "# comment\n").expect("write");
+        append_user_allow_other(&path).expect("append");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert!(contents.contains("user_allow_other"));
+        assert_eq!(contents.matches("user_allow_other").count(), 1);
     }
 
     #[test]

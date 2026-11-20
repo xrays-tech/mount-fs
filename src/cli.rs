@@ -44,7 +44,11 @@ pub enum Commands {
     Providers,
 
     /// Check the system for required dependencies.
-    Doctor,
+    Doctor {
+        /// Apply safe, minimal fixes (currently only `/etc/fuse.conf`).
+        #[arg(long)]
+        fix: bool,
+    },
 
     /// Install a mount engine.
     Install {
@@ -129,6 +133,15 @@ pub enum Commands {
     Status {
         /// Profile name.
         profile: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Manage systemd user services for persistent mounts.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
     },
 
     /// Show logs for a profile.
@@ -142,6 +155,38 @@ pub enum Commands {
 
     /// Print the version.
     Version,
+}
+
+/// Actions for `service`.
+#[derive(Debug, Subcommand)]
+pub enum ServiceAction {
+    /// Generate a systemd user unit for a profile.
+    Generate {
+        /// Profile name.
+        profile: String,
+        /// Path to the mount-fs binary (defaults to the current executable).
+        #[arg(long)]
+        exec: Option<PathBuf>,
+        /// Overwrite an existing unit.
+        #[arg(long)]
+        force: bool,
+        /// Render the unit without writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// List generated units.
+    List {
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a generated unit.
+    Remove {
+        /// Profile name.
+        profile: String,
+    },
 }
 
 /// Installation method selector.
@@ -302,7 +347,7 @@ mod tests {
         let cli = Cli::parse_from(["mount-fs", "-vv", "--no-color", "doctor"]);
         assert_eq!(cli.verbose, 2);
         assert!(cli.no_color);
-        assert!(matches!(cli.command, Some(Commands::Doctor)));
+        assert!(matches!(cli.command, Some(Commands::Doctor { fix: false })));
     }
 
     #[test]

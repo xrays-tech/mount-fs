@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-x86_64:
+    name: Build x86_64 (authoritative)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release archive
+        run: bash scripts/package.sh --locked
+      - name: Upload x86_64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  build-aarch64:
+    name: Build aarch64 (best-effort)
+    runs-on: ubuntu-latest
+    # The x86_64 build is authoritative; a cross-linker/toolchain failure must
+    # not block publishing the release.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build aarch64 binary with cross
+        uses: houseabsolute/actions-rust-cross@v0
+        with:
+          command: build
+          target: aarch64-unknown-linux-gnu
+          toolchain: stable
+          args: --release --locked
+      - name: Package aarch64 archive
+        run: bash scripts/package.sh --locked --target aarch64-unknown-linux-gnu --skip-build
+      - name: Upload aarch64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aarch64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-x86_64, build-aarch64]
+    # Publish even when the optional aarch64 job failed.
+    if: ${{ always() && needs.build-x86_64.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+      - name: List release files
+        run: ls -l dist
+      - name: Create or update the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

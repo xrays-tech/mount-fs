@@ -15,6 +15,7 @@
 debug/
 release/
 *.profraw
+dist/
 
 # Environment
 .env

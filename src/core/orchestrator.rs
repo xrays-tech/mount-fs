@@ -801,6 +801,12 @@ pub fn json_list(rows: &[Reconciled]) -> Result<String> {
         .map_err(|err| AppError::Config(format!("cannot serialize status: {err}")))
 }
 
+/// Serialize a single reconciled row as JSON.
+pub fn json_status(row: &Reconciled) -> Result<String> {
+    serde_json::to_string_pretty(row)
+        .map_err(|err| AppError::Config(format!("cannot serialize status: {err}")))
+}
+
 fn print_reconciled(row: &Reconciled) {
     println!(
         "{}: {} at {}",

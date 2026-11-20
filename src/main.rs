@@ -13,7 +13,9 @@ use clap::Parser;
 use dialoguer::{Input, Password};
 use tracing_subscriber::EnvFilter;
 
-use mount_fs::cli::{Cli, Commands, ConfigAction, InstallMethodArg, ProfileAction, ProviderArg};
+use mount_fs::cli::{
+    Cli, Commands, ConfigAction, InstallMethodArg, ProfileAction, ProviderArg, ServiceAction,
+};
 use mount_fs::config::{Config, ProviderKind};
 use mount_fs::core::config_ux;
 use mount_fs::core::creds;
@@ -23,7 +25,7 @@ use mount_fs::core::state::{self, StateRegistry};
 use mount_fs::error::{AppError, Result};
 use mount_fs::providers::registry;
 use mount_fs::system::fuse::RealMountSource;
-use mount_fs::system::{distro, pkg};
+use mount_fs::system::{distro, pkg, systemd};
 
 fn main() {
     let cli = Cli::parse();
@@ -74,7 +76,7 @@ fn run(command: Option<Commands>, config_path: Option<PathBuf>) -> Result<()> {
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some(Commands::Doctor) => mount_fs::system::doctor(),
+        Some(Commands::Doctor { fix }) => mount_fs::system::doctor(fix),
         Some(Commands::Providers) => cmd_providers(),
         Some(Commands::Install {
             engine,
@@ -117,7 +119,10 @@ fn run(command: Option<Commands>, config_path: Option<PathBuf>) -> Result<()> {
         ),
         Some(Commands::Umount { target, force, all }) => cmd_umount(&target, force, all),
         Some(Commands::List { json }) => cmd_list(json, config_path.as_deref()),
-        Some(Commands::Status { profile }) => cmd_status(&profile, config_path.as_deref()),
+        Some(Commands::Status { profile, json }) => {
+            cmd_status(&profile, config_path.as_deref(), json)
+        }
+        Some(Commands::Service { action }) => cmd_service(action, config_path.as_deref()),
         Some(Commands::Logs { profile, follow }) => cmd_logs(&profile, follow),
         None => {
             println!(
@@ -175,8 +180,12 @@ fn cmd_list(json: bool, config_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(profile: &str, config_path: Option<&Path>) -> Result<()> {
+fn cmd_status(profile: &str, config_path: Option<&Path>, json: bool) -> Result<()> {
     let row = orchestrator::status_with_config(&RealMountSource, profile, config_path)?;
+    if json {
+        println!("{}", orchestrator::json_status(&row)?);
+        return Ok(());
+    }
     println!("profile:    {}", row.profile.as_deref().unwrap_or("-"));
     println!("mountpoint: {}", row.mountpoint.display());
     println!("status:     {}", row.status);
@@ -197,10 +206,17 @@ fn cmd_logs(profile: &str, follow: bool) -> Result<()> {
         .unwrap_or_else(|| state::default_log_path(profile))?;
 
     if !path.exists() {
-        return Err(AppError::NotFound(format!(
-            "no log file for `{profile}` (expected {})",
-            path.display()
-        )));
+        if !follow {
+            println!(
+                "No log file for `{profile}` yet (expected {}).",
+                path.display()
+            );
+            return Ok(());
+        }
+        println!("Waiting for log file {} ...", path.display());
+        while !path.exists() {
+            thread::sleep(Duration::from_millis(250));
+        }
     }
 
     let mut file = fs::File::open(&path)?;
@@ -225,6 +241,75 @@ fn cmd_logs(profile: &str, follow: bool) -> Result<()> {
             position = length;
         }
     }
+}
+
+fn cmd_service(action: ServiceAction, config_path: Option<&Path>) -> Result<()> {
+    match action {
+        ServiceAction::Generate {
+            profile,
+            exec,
+            force,
+            dry_run,
+        } => {
+            let config = match config_path {
+                Some(path) => Config::load(path)?,
+                None => Config::load_default()?,
+            };
+            let configured = config
+                .profile(&profile)
+                .ok_or_else(|| AppError::NotFound(format!("profile `{profile}`")))?;
+            let mountpoint = configured.mountpoint.clone();
+
+            let exec = match exec {
+                Some(path) => absolute_exec(&path)?,
+                None => std::env::current_exe()?,
+            };
+
+            systemd::generate(&profile, &mountpoint, &exec, force, dry_run)?;
+            println!(
+                "Hint: systemctl --user daemon-reload && systemctl --user enable --now mount-fs-{profile}.service"
+            );
+
+            match &configured.credentials_ref {
+                Some(path) if path.exists() => {}
+                Some(path) => println!(
+                    "[WARN] credentials_ref {} does not exist; the service will fail to mount until it is created",
+                    path.display()
+                ),
+                None => println!(
+                    "[WARN] profile `{profile}` has no credentials_ref; systemd services do not inherit shell env. Run `mount-fs config login <provider> --profile {profile}` first."
+                ),
+            }
+            Ok(())
+        }
+        ServiceAction::List { json } => {
+            let units = systemd::list_units()?;
+            if json {
+                let text = serde_json::to_string_pretty(&units)
+                    .map_err(|err| AppError::Config(format!("cannot serialize services: {err}")))?;
+                println!("{text}");
+            } else if units.is_empty() {
+                println!("No generated services.");
+            } else {
+                for unit in units {
+                    println!("{}  {}", unit.profile, unit.path.display());
+                }
+            }
+            Ok(())
+        }
+        ServiceAction::Remove { profile } => {
+            let path = systemd::remove(&profile)?;
+            println!("Removed {}", path.display());
+            Ok(())
+        }
+    }
+}
+
+fn absolute_exec(path: &Path) -> Result<PathBuf> {
+    if !path.exists() {
+        return Err(AppError::NotFound(format!("executable {}", path.display())));
+    }
+    Ok(fs::canonicalize(path)?)
 }
 
 fn cmd_providers() -> Result<()> {
