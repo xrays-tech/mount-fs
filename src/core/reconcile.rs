@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use crate::core::state::StateRegistry;
 use crate::system::fuse::{is_fuse_fstype, MountEntry};
+use crate::system::supervisor::PidRecord;
 
 /// Health/ownership classification of a mount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -57,6 +58,14 @@ pub struct Reconciled {
     pub pid: Option<u32>,
 }
 
+fn sidecar_alive(sidecar: &PidRecord, alive: &dyn Fn(u32, Option<u64>) -> bool) -> bool {
+    if sidecar.starttime == 0 {
+        alive(sidecar.pid, None)
+    } else {
+        alive(sidecar.pid, Some(sidecar.starttime))
+    }
+}
+
 /// Reconcile `state` with `mounts`.
 ///
 /// `alive` receives `(pid, starttime)` and reports whether that exact process
@@ -94,10 +103,15 @@ pub fn reconcile(
                 pid: record.pid,
             },
             Some(mount) => {
-                let healthy = match record.pid {
+                let health_main = match record.pid {
                     Some(pid) => alive(pid, record.starttime),
                     None => true,
                 };
+                let health_sidecars = record
+                    .sidecars
+                    .iter()
+                    .all(|sidecar| sidecar_alive(sidecar, alive));
+                let healthy = health_main && health_sidecars;
                 Reconciled {
                     profile: Some(record.profile.clone()),
                     mountpoint: record.mountpoint.clone(),
@@ -166,6 +180,7 @@ mod tests {
             starttime: pid.map(|_| 42),
             log_path: None,
             credential_path: None,
+            sidecars: Vec::new(),
             mounted_at: 0,
         }
     }
@@ -215,6 +230,19 @@ mod tests {
         assert_eq!(rows[0].status, MountStatus::External);
         assert_eq!(rows[0].profile, None);
         assert_eq!(rows[0].mountpoint, PathBuf::from("/mnt/other"));
+    }
+
+    #[test]
+    fn hung_when_a_sidecar_is_dead() {
+        let mut rec = record("b", "/mnt/b", Some(10));
+        rec.sidecars = vec![PidRecord {
+            pid: 20,
+            starttime: 0,
+        }];
+        let state = registry(vec![rec]);
+        let mounts = vec![entry("/mnt/b", "fuse.s3fs", "bucket")];
+        let rows = reconcile(&state, &mounts, &|pid, _| pid == 10);
+        assert_eq!(rows[0].status, MountStatus::Hung);
     }
 
     #[test]

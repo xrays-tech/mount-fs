@@ -201,10 +201,10 @@ Aliyun Drive has two incompatible credential systems:
 
 - **Legacy web token** — used by `aliyundrive-fuse`, which is archived upstream,
   read-only, and accepts a token from the old web session.
-- **OpenAPI refresh token + drive id** — used by `qrypt` (read/write). The
-  registered `aliyundrive-webdav` engine reports its token kind and install plan,
-  but its rclone WebDAV bridge is not implemented in this release. These tokens
-  cannot be used with `aliyundrive-fuse`, and vice versa.
+- **OpenAPI refresh token + drive id** — used by `qrypt` (read/write) and by the
+  `aliyundrive-webdav` engine, which runs a loopback WebDAV server bridged to FUSE
+  through `rclone mount` (requires `rclone`). These tokens cannot be used with
+  `aliyundrive-fuse`, and vice versa.
 
 Check `mount-fs providers` to see each engine's `token_kind` and capability
 flags.

@@ -200,6 +200,7 @@ impl Engine for S3fsEngine {
             mountpoint: effective.mountpoint.clone(),
             unmount: UnmountStrategy::FuseMount3,
             credential_path: Some(credential_path),
+            sidecars: Vec::new(),
         })
     }
 }
@@ -352,6 +353,9 @@ fn test_profile() -> Profile {
         region: Some("us-east-1".to_string()),
         path_style: Some(true),
         drive_id: None,
+        client_id: None,
+        client_secret: None,
+        root_path: None,
     }
 }
 

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
 use crate::system::locking::FileLock;
+use crate::system::supervisor::PidRecord;
 
 /// Directory name under the state directory.
 pub const STATE_DIR_NAME: &str = "mount-fs";
@@ -44,6 +45,9 @@ pub struct MountRecord {
     pub log_path: Option<PathBuf>,
     /// Materialized credential file path.
     pub credential_path: Option<PathBuf>,
+    /// Sidecar processes (e.g. a WebDAV server) with starttime guards.
+    #[serde(default)]
+    pub sidecars: Vec<PidRecord>,
     /// Unix timestamp (seconds) when the mount was started.
     pub mounted_at: u64,
 }
@@ -246,6 +250,7 @@ mod tests {
             starttime: Some(123456),
             log_path: Some(PathBuf::from("/tmp/state/logs/bucket.log")),
             credential_path: Some(PathBuf::from("/tmp/run/creds-bucket-1.s3fs")),
+            sidecars: Vec::new(),
             mounted_at: 1_700_000_000,
         }
     }

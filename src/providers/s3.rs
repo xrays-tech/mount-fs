@@ -92,6 +92,9 @@ mod tests {
             region: None,
             path_style: None,
             drive_id: None,
+            client_id: None,
+            client_secret: None,
+            root_path: None,
         }
     }
 

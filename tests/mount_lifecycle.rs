@@ -220,6 +220,7 @@ fn record(
         starttime,
         log_path: None,
         credential_path: None,
+        sidecars: Vec::new(),
         mounted_at: 0,
     }
 }

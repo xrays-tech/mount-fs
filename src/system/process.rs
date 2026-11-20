@@ -123,8 +123,27 @@ pub fn pid_starttime(pid: u32) -> Option<u64> {
 }
 
 /// Whether `pid` is alive *and* still the same process incarnation.
+///
+/// Zombies are treated as dead (they still have `/proc` entries).
 pub fn is_alive(pid: u32, expected_starttime: u64) -> bool {
-    pid_starttime(pid) == Some(expected_starttime)
+    process_running(pid) && pid_starttime(pid) == Some(expected_starttime)
+}
+
+/// Whether a (non-zombie) process currently exists.
+pub fn pid_running(pid: u32) -> bool {
+    process_running(pid)
+}
+
+fn process_running(pid: u32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rfind(')')
+            .and_then(|close| stat.get(close + 1..))
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(|state| state != "Z" && state != "X")
+            .unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 /// Parse `starttime` from a `/proc/<pid>/stat` line.

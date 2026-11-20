@@ -147,6 +147,15 @@ pub struct Profile {
     /// Aliyun OpenAPI drive id (required by `qrypt`).
     #[serde(default)]
     pub drive_id: Option<String>,
+    /// Aliyun OpenAPI client id (optional; webdav).
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Aliyun OpenAPI client secret (optional; redacted).
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Aliyun root path (optional; webdav/qrypt).
+    #[serde(default)]
+    pub root_path: Option<String>,
 }
 
 #[cfg(test)]
@@ -166,6 +175,9 @@ impl Profile {
             region: None,
             path_style: None,
             drive_id: None,
+            client_id: None,
+            client_secret: None,
+            root_path: None,
         }
     }
 }

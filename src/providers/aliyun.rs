@@ -74,6 +74,7 @@ impl Provider for AliyunProvider {
                 }
             }
             "aliyundrive-webdav" => {
+                // OpenAPI token is required; client_id/client_secret are optional.
                 if creds::has_aliyun_token(profile) {
                     Ok(())
                 } else {
@@ -135,6 +136,9 @@ mod tests {
             region: None,
             path_style: None,
             drive_id: drive_id.map(str::to_string),
+            client_id: None,
+            client_secret: None,
+            root_path: None,
         }
     }
 

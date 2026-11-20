@@ -111,6 +111,9 @@ fn build_profile(new: &NewProfile) -> Result<Profile> {
             None
         },
         drive_id: new.drive_id.clone(),
+        client_id: None,
+        client_secret: None,
+        root_path: None,
     })
 }
 
@@ -166,6 +169,8 @@ pub fn set_profile_fields(config_path: &Path, name: &str, assignments: &[String]
             "endpoint" => profile.endpoint = non_empty(value),
             "region" => profile.region = non_empty(value),
             "drive_id" => profile.drive_id = non_empty(value),
+            "client_id" => profile.client_id = non_empty(value),
+            "root_path" => profile.root_path = non_empty(value),
             "path_style" => profile.path_style = Some(parse_bool(value)?),
             "allow_other" => profile.allow_other = parse_bool(value)?,
             "read_only" => profile.read_only = parse_bool(value)?,
@@ -234,6 +239,9 @@ fn profile_value(profile: &Profile, field: &str) -> Result<String> {
             .map(|value| value.to_string())
             .unwrap_or_default(),
         "drive_id" => profile.drive_id.clone().unwrap_or_default(),
+        "client_id" => profile.client_id.clone().unwrap_or_default(),
+        "client_secret" => profile.client_secret.clone().unwrap_or_default(),
+        "root_path" => profile.root_path.clone().unwrap_or_default(),
         "options.uid" => profile
             .options
             .uid
@@ -314,6 +322,12 @@ pub fn render_config(config: &Config, name: Option<&str>) -> Result<String> {
                     .unwrap_or_default(),
             ),
             ("drive_id", profile.drive_id.clone().unwrap_or_default()),
+            ("client_id", profile.client_id.clone().unwrap_or_default()),
+            (
+                "client_secret",
+                profile.client_secret.clone().unwrap_or_default(),
+            ),
+            ("root_path", profile.root_path.clone().unwrap_or_default()),
             (
                 "options.uid",
                 profile

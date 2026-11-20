@@ -417,6 +417,22 @@ pub fn gc(dirs: &RuntimeDirs, active_profiles: &[String]) -> Result<()> {
                     let _ = std::fs::remove_dir(entry.path());
                 }
             }
+            continue;
+        }
+
+        if let Some(rest) = name.strip_prefix("aliyundrive-webdav-") {
+            if let Some((key, pid)) = rest.rsplit_once('-') {
+                let entry_path = entry.path();
+                let token = entry_path.join("refresh_token");
+                let age_source = if token.exists() {
+                    token.as_path()
+                } else {
+                    entry_path.as_path()
+                };
+                if !retain_artifact(key, pid, &active, age_source) {
+                    let _ = std::fs::remove_dir_all(entry_path);
+                }
+            }
         }
     }
     Ok(())
@@ -445,8 +461,12 @@ fn is_young(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Remove a credential artifact, including an empty aliyundrive workdir.
+/// Remove a credential artifact, including empty workdirs and temp directories.
 pub fn remove_artifact(path: &Path) {
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+        return;
+    }
     let _ = std::fs::remove_file(path);
     if path.file_name() == Some(OsStr::new("refresh_token")) {
         if let Some(parent) = path.parent() {
@@ -473,6 +493,15 @@ pub fn aliyundrive_workdir_name(profile: &str) -> String {
 /// Artifact file name for a qrypt config.
 pub fn qrypt_config_name(profile: &str) -> String {
     format!("qrypt-{}-{}.toml", cred_key(profile), std::process::id())
+}
+
+/// Artifact directory name for an aliyundrive-webdav bridge.
+pub fn webdav_workdir_name(profile: &str) -> String {
+    format!(
+        "aliyundrive-webdav-{}-{}",
+        cred_key(profile),
+        std::process::id()
+    )
 }
 
 /// Stable credential-file key for a profile (`sanitized-name-hash`).

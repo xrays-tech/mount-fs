@@ -211,6 +211,7 @@ impl Engine for QryptEngine {
             mountpoint: effective.mountpoint.clone(),
             unmount: UnmountStrategy::FuseMount3,
             credential_path: Some(config_path),
+            sidecars: Vec::new(),
         })
     }
 }

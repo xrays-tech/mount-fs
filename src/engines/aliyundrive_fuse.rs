@@ -153,6 +153,7 @@ impl Engine for AliyundriveFuseEngine {
             mountpoint: effective.mountpoint.clone(),
             unmount: UnmountStrategy::FuseMount3,
             credential_path: Some(token_path),
+            sidecars: Vec::new(),
         })
     }
 }

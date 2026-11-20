@@ -9,7 +9,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -20,16 +20,32 @@ use crate::core::creds;
 use crate::core::install::render_command;
 use crate::core::reconcile::{reconcile, MountStatus, Reconciled};
 use crate::core::state::{self, MountRecord, StateRegistry};
-use crate::engines::{CredentialRetention, EffectiveMount, MountSecrets, TokenKind};
+use crate::engines::{CredentialRetention, EffectiveMount, MountSecrets, Readiness, TokenKind};
 use crate::error::{AppError, Result};
 use crate::providers;
 use crate::system::fuse::{self, MountSource};
 use crate::system::locking::FileLock;
+use crate::system::net;
 use crate::system::process::{self, CommandSpec};
+use crate::system::supervisor::PidRecord;
 
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SIDECAR_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct SidecarSpec {
+    spec: CommandSpec,
+    readiness: Readiness,
+}
+
+fn to_command_spec(program: &Path, argv: &[String], env: &[(String, String)]) -> CommandSpec {
+    let mut spec = CommandSpec::new(program.to_path_buf()).args(argv.iter().cloned());
+    for (key, value) in env {
+        spec = spec.env(key.clone(), value.clone());
+    }
+    spec
+}
 
 /// CLI overrides for a mount.
 #[derive(Debug, Clone, Default)]
@@ -105,16 +121,7 @@ pub fn mount(
         )));
     }
 
-    // S3 `credentials_ref` is not honored yet (M4); Aliyun credentials_ref is.
-    static CREDS_REF_WARNING: std::sync::Once = std::sync::Once::new();
-    if engine.token_kind() == TokenKind::AwsKey && profile.credentials_ref.is_some() {
-        CREDS_REF_WARNING.call_once(|| {
-            tracing::warn!(
-                "S3 `credentials_ref` is not honored until M4; using env/interactive credentials"
-            )
-        });
-    }
-
+    // `credentials_ref` is honored for both S3 and Aliyun (M4).
     let secrets = resolve_secrets(engine.as_ref(), &profile)?;
 
     let dirs = creds::RuntimeDirs::resolve()?;
@@ -201,12 +208,22 @@ pub fn mount(
     let plan = engine.plan_mount(&profile, &effective, &secrets)?;
     let credential_path = plan.credential_path.clone();
 
-    let mut spec = CommandSpec::new(plan.program.clone()).args(plan.argv.clone());
-    for (key, value) in &plan.env {
-        spec = spec.env(key.clone(), value.clone());
-    }
+    let spec = to_command_spec(&plan.program, &plan.argv, &plan.env);
+    let sidecars: Vec<SidecarSpec> = plan
+        .sidecars
+        .iter()
+        .map(|sidecar| SidecarSpec {
+            spec: to_command_spec(&sidecar.program, &sidecar.argv, &sidecar.env),
+            readiness: sidecar.readiness,
+        })
+        .collect();
 
     if opts.dry_run {
+        for sidecar in &plan.sidecars {
+            let mut display = vec![sidecar.program.display().to_string()];
+            display.extend(sidecar.argv.iter().cloned());
+            println!("Sidecar command: {}", render_command(&display));
+        }
         let mut display = vec![plan.program.display().to_string()];
         display.extend(plan.argv.iter().cloned());
         println!("Mount command: {}", render_command(&display));
@@ -218,6 +235,7 @@ pub fn mount(
     if opts.foreground {
         return mount_foreground(
             &spec,
+            &sidecars,
             &profile_name,
             &profile,
             engine.id(),
@@ -230,6 +248,7 @@ pub fn mount(
     mount_background(BackgroundSpec {
         source,
         spec: &spec,
+        sidecars: &sidecars,
         profile_name: &profile_name,
         profile: &profile,
         engine_id: engine.id(),
@@ -242,6 +261,7 @@ pub fn mount(
 struct BackgroundSpec<'a> {
     source: &'a dyn MountSource,
     spec: &'a CommandSpec,
+    sidecars: &'a [SidecarSpec],
     profile_name: &'a str,
     profile: &'a Profile,
     engine_id: &'a str,
@@ -254,6 +274,7 @@ fn mount_background(ctx: BackgroundSpec<'_>) -> Result<()> {
     let BackgroundSpec {
         source,
         spec,
+        sidecars,
         profile_name,
         profile,
         engine_id,
@@ -262,12 +283,28 @@ fn mount_background(ctx: BackgroundSpec<'_>) -> Result<()> {
         credential_path,
     } = ctx;
 
-    let mut child = process::spawn_background_child(spec, log_path)?;
+    let mut sidecar_children = match spawn_sidecars(sidecars, log_path) {
+        Ok(children) => children,
+        Err(err) => {
+            cleanup_credential(credential_path);
+            return Err(err);
+        }
+    };
+
+    let mut child = match process::spawn_background_child(spec, log_path) {
+        Ok(child) => child,
+        Err(err) => {
+            kill_children(&mut sidecar_children);
+            cleanup_credential(credential_path);
+            return Err(err.into());
+        }
+    };
     let pid = child.id();
 
     if let Err(err) = wait_for_mount(source, mountpoint, &mut child, log_path) {
         let _ = child.kill();
         let _ = child.wait();
+        kill_children(&mut sidecar_children);
         cleanup_credential(credential_path);
         return Err(err);
     }
@@ -287,6 +324,7 @@ fn mount_background(ctx: BackgroundSpec<'_>) -> Result<()> {
         starttime,
         log_path: Some(log_path.to_path_buf()),
         credential_path: credential_path.clone(),
+        sidecars: pid_records(&sidecar_children),
         mounted_at: state::now_epoch_secs(),
     };
     if let Err(err) = state::update_registry(|registry| {
@@ -295,13 +333,15 @@ fn mount_background(ctx: BackgroundSpec<'_>) -> Result<()> {
     }) {
         let _ = child.kill();
         let _ = child.wait();
+        kill_children(&mut sidecar_children);
         cleanup_credential(credential_path);
         return Err(err);
     }
 
     // Keep the credential artifact: it must live as long as the mount does.
-    // Detach: the engine keeps running after this process exits.
+    // Detach: the processes keep running after this process exits.
     drop(child);
+    drop(sidecar_children);
 
     println!(
         "Mounted {} at {} (pid {pid})",
@@ -311,8 +351,53 @@ fn mount_background(ctx: BackgroundSpec<'_>) -> Result<()> {
     Ok(())
 }
 
+fn spawn_sidecars(sidecars: &[SidecarSpec], log_path: &Path) -> Result<Vec<Child>> {
+    let mut children = Vec::new();
+    for sidecar in sidecars {
+        let child = match process::spawn_background_child(&sidecar.spec, log_path) {
+            Ok(child) => child,
+            Err(err) => {
+                kill_children(&mut children);
+                return Err(err.into());
+            }
+        };
+        children.push(child);
+
+        if let Readiness::TcpPort(port) = sidecar.readiness {
+            if let Err(err) = net::wait_for_tcp_port(port, SIDECAR_TIMEOUT) {
+                kill_children(&mut children);
+                return Err(AppError::Unsupported(format!(
+                    "sidecar did not become ready on 127.0.0.1:{port}: {err}"
+                )));
+            }
+        }
+    }
+    Ok(children)
+}
+
+fn kill_children(children: &mut [Child]) {
+    for child in children.iter_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn pid_records(children: &[Child]) -> Vec<PidRecord> {
+    children
+        .iter()
+        .map(|child| {
+            let pid = child.id();
+            PidRecord {
+                pid,
+                starttime: process::pid_starttime(pid).unwrap_or(0),
+            }
+        })
+        .collect()
+}
+
 fn mount_foreground(
     spec: &CommandSpec,
+    sidecars: &[SidecarSpec],
     profile_name: &str,
     profile: &Profile,
     engine_id: &str,
@@ -331,7 +416,22 @@ fn mount_foreground(
     )
     .map_err(|err| AppError::Unsupported(format!("cannot install SIGTERM handler: {err}")))?;
 
-    let mut child = spec.to_command().spawn()?;
+    let mut sidecar_children = match spawn_foreground_sidecars(sidecars) {
+        Ok(children) => children,
+        Err(err) => {
+            cleanup_credential(&credential_path);
+            return Err(err);
+        }
+    };
+
+    let mut child = match spec.to_command().spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            kill_children(&mut sidecar_children);
+            cleanup_credential(&credential_path);
+            return Err(err.into());
+        }
+    };
     let pid = child.id();
     let starttime = process::pid_starttime(pid);
 
@@ -349,6 +449,7 @@ fn mount_foreground(
         starttime,
         log_path: None,
         credential_path: credential_path.clone(),
+        sidecars: pid_records(&sidecar_children),
         mounted_at: state::now_epoch_secs(),
     };
     if let Err(err) = state::update_registry(|registry| {
@@ -357,6 +458,7 @@ fn mount_foreground(
     }) {
         let _ = child.kill();
         let _ = child.wait();
+        kill_children(&mut sidecar_children);
         cleanup_credential(&credential_path);
         return Err(err);
     }
@@ -371,6 +473,7 @@ fn mount_foreground(
         if interrupted.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
+            kill_children(&mut sidecar_children);
             cleanup_foreground(profile_name, &credential_path);
             eprintln!("interrupted; shutting down");
             std::process::exit(130);
@@ -378,6 +481,7 @@ fn mount_foreground(
 
         match child.try_wait() {
             Ok(Some(status)) => {
+                kill_children(&mut sidecar_children);
                 cleanup_foreground(profile_name, &credential_path);
                 if !status.success() {
                     return Err(AppError::Unsupported(format!(
@@ -389,11 +493,40 @@ fn mount_foreground(
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(err) => {
                 let _ = child.kill();
+                kill_children(&mut sidecar_children);
                 cleanup_foreground(profile_name, &credential_path);
                 return Err(err.into());
             }
         }
     }
+}
+
+fn spawn_foreground_sidecars(sidecars: &[SidecarSpec]) -> Result<Vec<Child>> {
+    let mut children = Vec::new();
+    for sidecar in sidecars {
+        let mut command = sidecar.spec.to_command();
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                kill_children(&mut children);
+                return Err(err.into());
+            }
+        };
+        children.push(child);
+        if let Readiness::TcpPort(port) = sidecar.readiness {
+            if let Err(err) = net::wait_for_tcp_port(port, SIDECAR_TIMEOUT) {
+                kill_children(&mut children);
+                return Err(AppError::Unsupported(format!(
+                    "sidecar did not become ready on 127.0.0.1:{port}: {err}"
+                )));
+            }
+        }
+    }
+    Ok(children)
 }
 
 /// Remove the foreground state record and credential artifact (best effort).
@@ -561,6 +694,16 @@ fn unmount_record(source: &dyn MountSource, record: &MountRecord, force: bool) -
     if let Some(pid) = record.pid {
         if engine_alive(pid, record.starttime) {
             process::terminate(pid);
+        }
+    }
+    for sidecar in &record.sidecars {
+        let alive = if sidecar.starttime == 0 {
+            process::pid_starttime(sidecar.pid).is_some()
+        } else {
+            process::is_alive(sidecar.pid, sidecar.starttime)
+        };
+        if alive {
+            process::terminate(sidecar.pid);
         }
     }
     if record.engine == "aliyundrive-fuse" {
@@ -841,7 +984,7 @@ fn resolve_secrets(engine: &dyn crate::engines::Engine, profile: &Profile) -> Re
 fn engine_alive(pid: u32, starttime: Option<u64>) -> bool {
     match starttime {
         Some(starttime) => process::is_alive(pid, starttime),
-        None => process::pid_starttime(pid).is_some(),
+        None => process::pid_running(pid),
     }
 }
 
@@ -884,6 +1027,9 @@ fn resolve_profile(
             region: None,
             path_style: Some(true),
             drive_id: None,
+            client_id: None,
+            client_secret: None,
+            root_path: None,
         };
         return Ok((target.to_string(), profile));
     }

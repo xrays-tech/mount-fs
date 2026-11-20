@@ -172,7 +172,7 @@ The Aliyun engines do **not** share tokens:
 | --- | --- | --- | --- |
 | `aliyundrive-fuse` | legacy web token | no (read-only) | archived upstream |
 | `qrypt` | OpenAPI refresh token | yes | `drive_id` |
-| `aliyundrive-webdav` | OpenAPI refresh token | not implemented | rclone bridge (registered, not mounted in this release) |
+| `aliyundrive-webdav` | OpenAPI refresh token | yes | `rclone`; runs a loopback WebDAV server + `rclone mount` |
 
 Common causes:
 

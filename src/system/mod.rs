@@ -9,6 +9,7 @@ pub mod distro;
 pub mod download;
 pub mod fuse;
 pub mod locking;
+pub mod net;
 pub mod pkg;
 pub mod privilege;
 pub mod process;

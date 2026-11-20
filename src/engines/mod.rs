@@ -139,6 +139,44 @@ pub enum UnmountStrategy {
     Umount,
 }
 
+/// Readiness condition before starting the next process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    /// Process can be considered started immediately.
+    Immediate,
+    /// Wait for a TCP listener on `127.0.0.1:<port>`.
+    TcpPort(u16),
+}
+
+/// An additional process that must run alongside the main mount process.
+#[derive(Clone)]
+pub struct PlannedProcess {
+    /// Program to execute.
+    pub program: PathBuf,
+    /// Arguments (never containing credentials).
+    pub argv: Vec<String>,
+    /// Extra environment variables.
+    pub env: Vec<(String, String)>,
+    /// Readiness condition before the main process starts.
+    pub readiness: Readiness,
+}
+
+impl fmt::Debug for PlannedProcess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env: Vec<String> = self
+            .env
+            .iter()
+            .map(|(key, _)| format!("{key}=<redacted>"))
+            .collect();
+        f.debug_struct("PlannedProcess")
+            .field("program", &self.program)
+            .field("argv", &self.argv)
+            .field("env", &env)
+            .field("readiness", &self.readiness)
+            .finish()
+    }
+}
+
 /// Secrets resolved for a mount (never serialized or logged).
 #[derive(Clone, Default)]
 pub struct MountSecrets {
@@ -167,6 +205,8 @@ pub struct MountPlan {
     pub unmount: UnmountStrategy,
     /// Temporary credential artifact to keep while mounted and unlink later.
     pub credential_path: Option<PathBuf>,
+    /// Additional processes (e.g. a WebDAV server) started before the main one.
+    pub sidecars: Vec<PlannedProcess>,
 }
 
 impl fmt::Debug for MountSecrets {
@@ -197,6 +237,7 @@ impl fmt::Debug for MountPlan {
             .field("mountpoint", &self.mountpoint)
             .field("unmount", &self.unmount)
             .field("credential_path", &self.credential_path)
+            .field("sidecars", &self.sidecars)
             .finish()
     }
 }
@@ -336,6 +377,7 @@ mod tests {
             mountpoint: PathBuf::from("/mnt/x"),
             unmount: UnmountStrategy::FuseMount3,
             credential_path: None,
+            sidecars: Vec::new(),
         };
         let rendered = format!("{plan:?}");
         assert!(!rendered.contains("TOKEN_SECRET"), "{rendered}");
