@@ -12,6 +12,7 @@ use std::process::Command;
 use crate::engines::{Engine, InstallMethod, InstallPlan, ReleaseAsset};
 use crate::error::{AppError, Result};
 use crate::system::checksums;
+use crate::system::deps::Dependency;
 use crate::system::distro::Distro;
 use crate::system::download::{self, default_bin_dir, install_binary_as};
 use crate::system::pkg::PackageManager;
@@ -334,6 +335,78 @@ fn effective_manager(distro: &Distro, pkg: PackageManager) -> PackageManager {
     }
 }
 
+/// Missing dependencies from `deps`.
+pub fn missing_dependencies(deps: &[Dependency]) -> Vec<Dependency> {
+    deps.iter()
+        .copied()
+        .filter(|dependency| !dependency.present())
+        .collect()
+}
+
+/// Deduplicated package names for a set of dependencies.
+pub fn dependency_packages(deps: &[Dependency]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut packages = Vec::new();
+    for dependency in deps {
+        for package in dependency.packages {
+            if seen.insert(*package) {
+                packages.push((*package).to_string());
+            }
+        }
+    }
+    packages
+}
+
+/// Build the package-manager argv for a set of dependencies.
+pub fn dependency_install_argv(
+    deps: &[Dependency],
+    manager: PackageManager,
+) -> Option<Vec<String>> {
+    let packages = dependency_packages(deps);
+    if packages.is_empty() {
+        return None;
+    }
+    let refs: Vec<&str> = packages.iter().map(String::as_str).collect();
+    manager.install_argv(&refs)
+}
+
+/// Install missing runtime dependencies through the package manager.
+pub fn install_dependencies(
+    deps: &[Dependency],
+    distro: &Distro,
+    pkg: &PackageManager,
+    dry_run: bool,
+    assume_yes: bool,
+) -> Result<()> {
+    let missing = missing_dependencies(deps);
+    if missing.is_empty() {
+        println!("All runtime dependencies are present.");
+        return Ok(());
+    }
+
+    let manager = effective_manager(distro, *pkg);
+    let argv = dependency_install_argv(&missing, manager).ok_or_else(|| {
+        let names: Vec<&str> = missing.iter().map(|dependency| dependency.id).collect();
+        AppError::Unsupported(format!(
+            "missing dependencies ({}) cannot be installed automatically; \
+             enable the fuse kernel module and install fuse3 manually",
+            names.join(", ")
+        ))
+    })?;
+
+    let escalation = choose_escalation()?;
+    let escalated = escalated_argv(escalation, Path::new(&argv[0]), &argv[1..]);
+    println!("Dependency install command: {}", render_command(&escalated));
+
+    if dry_run {
+        println!("Dry run: not executing dependency installation.");
+        return Ok(());
+    }
+    // Package installs are already explicit (via `install`/`deps install`).
+    let _ = assume_yes;
+    run_command(&escalated)
+}
+
 fn run_command(argv: &[String]) -> Result<()> {
     let program = argv
         .first()
@@ -633,5 +706,51 @@ mod tests {
             locate_binary(std::slice::from_ref(&file), "qrypt"),
             Some(file)
         );
+    }
+
+    fn dependency(binary: &'static str, packages: &'static [&'static str]) -> Dependency {
+        Dependency {
+            id: binary,
+            description: binary,
+            check: crate::system::deps::DepCheck::Binary(binary),
+            packages,
+        }
+    }
+
+    #[test]
+    fn dependency_packages_are_deduped() {
+        let deps = vec![
+            dependency("missing-a", &["fuse3"]),
+            dependency("missing-b", &["rclone"]),
+            dependency("missing-c", &["fuse3"]),
+        ];
+        assert_eq!(dependency_packages(&deps), vec!["fuse3", "rclone"]);
+        let argv = dependency_install_argv(&deps, PackageManager::Dnf).expect("argv");
+        assert_eq!(argv, vec!["dnf", "install", "-y", "fuse3", "rclone"]);
+    }
+
+    #[test]
+    fn missing_dependencies_filters_present() {
+        let deps = vec![
+            dependency("sh", &["x"]),
+            dependency("mount-fs-definitely-not-a-real-binary", &["y"]),
+        ];
+        let missing = missing_dependencies(&deps);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].id, "mount-fs-definitely-not-a-real-binary");
+    }
+
+    #[test]
+    fn device_only_dependency_cannot_be_installed() {
+        let deps = vec![Dependency {
+            id: "fuse-device",
+            description: "FUSE device",
+            check: crate::system::deps::DepCheck::Device("/no/such/mount-fs-device"),
+            packages: &[],
+        }];
+        let distro = crate::system::distro::parse("ID=fedora\n");
+        let err = install_dependencies(&deps, &distro, &PackageManager::Dnf, true, false)
+            .expect_err("cannot install a device");
+        assert!(err.to_string().contains("cannot be installed"), "{err}");
     }
 }

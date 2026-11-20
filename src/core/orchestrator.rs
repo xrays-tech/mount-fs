@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{expand_tilde, Config, MountOptions, Profile, ProviderKind};
 use crate::core::creds;
-use crate::core::install::render_command;
+use crate::core::install::{self, render_command, InstallRequest};
 use crate::core::reconcile::{reconcile, MountStatus, Reconciled};
 use crate::core::state::{self, MountRecord, StateRegistry};
 use crate::engines::{CredentialRetention, EffectiveMount, MountSecrets, Readiness, TokenKind};
@@ -28,6 +28,7 @@ use crate::system::locking::FileLock;
 use crate::system::net;
 use crate::system::process::{self, CommandSpec};
 use crate::system::supervisor::PidRecord;
+use crate::system::{distro, pkg};
 
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -84,6 +85,8 @@ pub struct MountOptionsArg {
     pub foreground: bool,
     /// Print the command without executing it.
     pub dry_run: bool,
+    /// Install missing engines/dependencies before mounting.
+    pub auto_install: bool,
     /// Ad-hoc bucket name (when `target` is a provider id).
     pub bucket: Option<String>,
     /// Ad-hoc endpoint (when `target` is a provider id).
@@ -112,23 +115,135 @@ pub fn mount(
                 profile.provider
             ))
         })?;
-    provider.validate(&profile)?;
-    let engine = select_engine(
-        provider.as_ref(),
-        &profile,
-        config.general.engine_auto_fallback,
-    )?;
+    let auto_install = opts.auto_install || config.general.auto_install;
+    let engine = if auto_install {
+        if let Some(requested) = profile.engine.as_deref() {
+            // Auto-install the explicitly requested engine rather than falling
+            // back to a different installed one.
+            provider
+                .engines()
+                .into_iter()
+                .find(|engine| engine.id() == requested)
+                .ok_or_else(|| {
+                    AppError::Unsupported(format!(
+                        "engine `{requested}` is not supported for provider `{}`",
+                        provider.id()
+                    ))
+                })?
+        } else {
+            match select_engine(
+                provider.as_ref(),
+                &profile,
+                config.general.engine_auto_fallback,
+            ) {
+                Ok(engine) => engine,
+                Err(_) => provider
+                    .engines()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| AppError::NotFound("provider has no engines".to_string()))?,
+            }
+        }
+    } else {
+        select_engine(
+            provider.as_ref(),
+            &profile,
+            config.general.engine_auto_fallback,
+        )?
+    };
     // Record the actually selected engine so credential resolution knows
     // whether a drive id is required (qrypt) or not (webdav/fuse).
     profile.engine = Some(engine.id().to_string());
 
-    let detected = engine.detect();
+    let detected_distro = distro::detect();
+    let manager = pkg::PackageManager::detect();
+    let mut detected = engine.detect();
     if !detected.found {
-        return Err(AppError::NotFound(format!(
-            "engine `{}` is not installed; run: mount-fs install {}",
-            engine.id(),
-            engine.id()
-        )));
+        if !auto_install {
+            return Err(AppError::NotFound(format!(
+                "engine `{}` is not installed; run: mount-fs install {}",
+                engine.id(),
+                engine.id()
+            )));
+        }
+        if opts.dry_run {
+            install::install_engine(
+                engine.as_ref(),
+                &detected_distro,
+                manager,
+                InstallRequest::Auto,
+                true,
+                false,
+            )?;
+            install::install_dependencies(
+                &engine.runtime_deps(),
+                &detected_distro,
+                &manager,
+                true,
+                false,
+            )?;
+            return Ok(());
+        }
+        install::install_engine(
+            engine.as_ref(),
+            &detected_distro,
+            manager,
+            InstallRequest::Auto,
+            false,
+            true,
+        )?;
+        install::install_dependencies(
+            &engine.runtime_deps(),
+            &detected_distro,
+            &manager,
+            false,
+            true,
+        )?;
+        detected = engine.detect();
+        if !detected.found {
+            return Err(AppError::Unsupported(format!(
+                "engine `{}` is still not installed after auto-install",
+                engine.id()
+            )));
+        }
+    }
+
+    let missing: Vec<_> = engine
+        .runtime_deps()
+        .into_iter()
+        .filter(|dependency| !dependency.present())
+        .collect();
+    if !missing.is_empty() {
+        if !auto_install {
+            let names: Vec<&str> = missing.iter().map(|dependency| dependency.id).collect();
+            return Err(AppError::Unsupported(format!(
+                "engine `{}` is missing runtime dependencies: {}; run: mount-fs deps install --engine {}",
+                engine.id(),
+                names.join(", "),
+                engine.id()
+            )));
+        }
+        if opts.dry_run {
+            install::install_dependencies(&missing, &detected_distro, &manager, true, false)?;
+            return Ok(());
+        }
+        install::install_dependencies(&missing, &detected_distro, &manager, false, true)?;
+        let still_missing: Vec<_> = engine
+            .runtime_deps()
+            .into_iter()
+            .filter(|dependency| !dependency.present())
+            .collect();
+        if !still_missing.is_empty() {
+            let names: Vec<&str> = still_missing
+                .iter()
+                .map(|dependency| dependency.id)
+                .collect();
+            return Err(AppError::Unsupported(format!(
+                "engine `{}` is still missing runtime dependencies: {}",
+                engine.id(),
+                names.join(", ")
+            )));
+        }
     }
     if let (Some(requirement), Some(version)) = (engine.min_version(), detected.version.as_ref()) {
         if !requirement.matches(version) {
@@ -145,6 +260,10 @@ pub fn mount(
             engine.id()
         )));
     }
+
+    // Validate only after any auto-install planning/early return, so a
+    // credential error cannot mask the install plan in `--auto-install --dry-run`.
+    provider.validate(&profile)?;
 
     // `credentials_ref` is honored for both S3 and Aliyun (M4).
     let secrets = resolve_secrets(engine.as_ref(), &profile)?;

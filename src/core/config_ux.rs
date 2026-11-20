@@ -211,6 +211,7 @@ fn raw_value(config: &Config, key: &str) -> Result<String> {
             "mount_root" => Ok(config.general.mount_root.display().to_string()),
             "allow_other" => Ok(config.general.allow_other.to_string()),
             "engine_auto_fallback" => Ok(config.general.engine_auto_fallback.to_string()),
+            "auto_install" => Ok(config.general.auto_install.to_string()),
             "log_level" => Ok(config.general.log_level.clone().unwrap_or_default()),
             other => Err(AppError::NotFound(format!(
                 "unknown config key `general.{other}`"
@@ -290,6 +291,7 @@ pub fn render_config(config: &Config, name: Option<&str>) -> Result<String> {
         "engine_auto_fallback = {}\n",
         config.general.engine_auto_fallback
     ));
+    out.push_str(&format!("auto_install = {}\n", config.general.auto_install));
     out.push_str(&format!(
         "log_level = {}\n",
         config.general.log_level.as_deref().unwrap_or("")

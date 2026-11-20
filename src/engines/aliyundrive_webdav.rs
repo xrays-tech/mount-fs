@@ -223,6 +223,10 @@ impl Engine for AliyundriveWebdavEngine {
         TokenKind::OpenApi
     }
 
+    fn runtime_deps(&self) -> Vec<crate::system::deps::Dependency> {
+        crate::system::deps::engine_deps(self.id())
+    }
+
     fn credential_retention(&self) -> CredentialRetention {
         CredentialRetention::Temp
     }

@@ -63,6 +63,9 @@ pub enum Commands {
         /// Allow executing the source-build recipe.
         #[arg(long)]
         yes: bool,
+        /// Do not install runtime dependencies after the engine.
+        #[arg(long)]
+        no_deps: bool,
     },
 
     /// Uninstall a mount engine.
@@ -108,6 +111,9 @@ pub enum Commands {
         /// Print the command without executing it.
         #[arg(long)]
         dry_run: bool,
+        /// Install missing engines/dependencies before mounting.
+        #[arg(long)]
+        auto_install: bool,
     },
 
     /// Unmount a mounted profile or mountpoint.
@@ -153,8 +159,43 @@ pub enum Commands {
         follow: bool,
     },
 
+    /// Show or install runtime dependencies.
+    Deps {
+        #[command(subcommand)]
+        action: Option<DepsAction>,
+        /// Engine id.
+        #[arg(long)]
+        engine: Option<String>,
+        /// Profile name.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Emit JSON (status only).
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print the version.
     Version,
+}
+
+/// Actions for `deps`.
+#[derive(Debug, Subcommand)]
+pub enum DepsAction {
+    /// Install missing dependencies via the package manager.
+    Install {
+        /// Engine id.
+        #[arg(long)]
+        engine: Option<String>,
+        /// Profile name.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Print the command without executing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm installing system packages.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Actions for `service`.
@@ -373,12 +414,54 @@ mod tests {
                 method,
                 dry_run,
                 yes,
+                no_deps,
             }) => {
                 assert_eq!(engine, "s3fs-fuse");
                 assert_eq!(method, InstallMethodArg::Source);
                 assert!(dry_run);
                 assert!(yes);
+                assert!(!no_deps);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_deps_install() {
+        let cli = Cli::parse_from([
+            "mount-fs",
+            "deps",
+            "install",
+            "--engine",
+            "aliyundrive-webdav",
+            "--dry-run",
+        ]);
+        match cli.command {
+            Some(Commands::Deps {
+                action:
+                    Some(DepsAction::Install {
+                        engine, dry_run, ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(engine.as_deref(), Some("aliyundrive-webdav"));
+                assert!(dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_mount_auto_install_and_install_no_deps() {
+        let cli = Cli::parse_from(["mount-fs", "mount", "p", "--auto-install"]);
+        match cli.command {
+            Some(Commands::Mount { auto_install, .. }) => assert!(auto_install),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::parse_from(["mount-fs", "install", "s3fs-fuse", "--no-deps"]);
+        match cli.command {
+            Some(Commands::Install { no_deps, .. }) => assert!(no_deps),
             other => panic!("unexpected command: {other:?}"),
         }
     }

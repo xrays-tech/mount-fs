@@ -14,7 +14,8 @@ use dialoguer::{Input, Password};
 use tracing_subscriber::EnvFilter;
 
 use mount_fs::cli::{
-    Cli, Commands, ConfigAction, InstallMethodArg, ProfileAction, ProviderArg, ServiceAction,
+    Cli, Commands, ConfigAction, DepsAction, InstallMethodArg, ProfileAction, ProviderArg,
+    ServiceAction,
 };
 use mount_fs::config::{Config, ProviderKind};
 use mount_fs::core::config_ux;
@@ -22,10 +23,11 @@ use mount_fs::core::creds;
 use mount_fs::core::install::{self, InstallRequest};
 use mount_fs::core::orchestrator::{self, MountOptionsArg};
 use mount_fs::core::state::{self, StateRegistry};
+use mount_fs::engines::Engine;
 use mount_fs::error::{AppError, Result};
 use mount_fs::providers::registry;
 use mount_fs::system::fuse::RealMountSource;
-use mount_fs::system::{distro, pkg, systemd};
+use mount_fs::system::{deps, distro, pkg, systemd};
 
 fn main() {
     let cli = Cli::parse();
@@ -83,7 +85,8 @@ fn run(command: Option<Commands>, config_path: Option<PathBuf>) -> Result<()> {
             method,
             dry_run,
             yes,
-        }) => cmd_install(&engine, method, dry_run, yes),
+            no_deps,
+        }) => cmd_install(&engine, method, dry_run, yes, no_deps),
         Some(Commands::Uninstall { engine }) => cmd_uninstall(&engine),
         Some(Commands::Config { action }) => cmd_config(action, config_path.as_deref()),
         Some(Commands::Mount {
@@ -97,6 +100,7 @@ fn run(command: Option<Commands>, config_path: Option<PathBuf>) -> Result<()> {
             allow_other,
             foreground,
             dry_run,
+            auto_install,
         }) => cmd_mount(
             &target,
             config_path.as_deref(),
@@ -113,6 +117,7 @@ fn run(command: Option<Commands>, config_path: Option<PathBuf>) -> Result<()> {
                 allow_other: allow_other.then_some(true),
                 foreground,
                 dry_run,
+                auto_install,
                 bucket,
                 endpoint,
             },
@@ -123,6 +128,18 @@ fn run(command: Option<Commands>, config_path: Option<PathBuf>) -> Result<()> {
             cmd_status(&profile, config_path.as_deref(), json)
         }
         Some(Commands::Service { action }) => cmd_service(action, config_path.as_deref()),
+        Some(Commands::Deps {
+            action,
+            engine,
+            profile,
+            json,
+        }) => cmd_deps(
+            action,
+            engine.as_deref(),
+            profile.as_deref(),
+            json,
+            config_path.as_deref(),
+        ),
         Some(Commands::Logs { profile, follow }) => cmd_logs(&profile, follow),
         None => {
             println!(
@@ -312,6 +329,153 @@ fn absolute_exec(path: &Path) -> Result<PathBuf> {
     Ok(fs::canonicalize(path)?)
 }
 
+fn cmd_deps(
+    action: Option<DepsAction>,
+    engine_id: Option<&str>,
+    profile_name: Option<&str>,
+    json: bool,
+    config_path: Option<&Path>,
+) -> Result<()> {
+    match action {
+        Some(DepsAction::Install {
+            engine,
+            profile,
+            dry_run,
+            yes,
+        }) => {
+            let engine_id = engine.as_deref().or(engine_id);
+            let profile_name = profile.as_deref().or(profile_name);
+            let engines = deps_engines(config_path, engine_id, profile_name)?;
+            let dependencies = collect_dependencies(&engines);
+            if dependencies.is_empty() {
+                println!("No dependencies.");
+                return Ok(());
+            }
+            let distro_detected = distro::detect();
+            let manager = pkg::PackageManager::detect();
+            install::install_dependencies(&dependencies, &distro_detected, &manager, dry_run, yes)
+        }
+        None => {
+            let engines = deps_engines(config_path, engine_id, profile_name)?;
+            let dependencies = collect_dependencies(&engines);
+            let statuses = deps::check(&dependencies);
+            if json {
+                let text = serde_json::to_string_pretty(&statuses).map_err(|err| {
+                    AppError::Config(format!("cannot serialize dependencies: {err}"))
+                })?;
+                println!("{text}");
+            } else if statuses.is_empty() {
+                println!("No dependencies.");
+            } else {
+                for status in statuses {
+                    let tag = if status.present { "[ OK ]" } else { "[WARN]" };
+                    println!(
+                        "{tag} {}: {} ({})",
+                        status.dependency.id, status.dependency.description, status.detail
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn dedupe_engines(engines: Vec<Box<dyn Engine>>) -> Vec<Box<dyn Engine>> {
+    let mut seen: Vec<&'static str> = Vec::new();
+    engines
+        .into_iter()
+        .filter(|engine| {
+            let id = engine.id();
+            if seen.contains(&id) {
+                false
+            } else {
+                seen.push(id);
+                true
+            }
+        })
+        .collect()
+}
+
+fn all_engines() -> Vec<Box<dyn Engine>> {
+    registry()
+        .into_iter()
+        .flat_map(|provider| provider.engines())
+        .collect()
+}
+
+fn find_engine(engine_id: &str) -> Result<Box<dyn Engine>> {
+    all_engines()
+        .into_iter()
+        .find(|engine| engine.id() == engine_id)
+        .ok_or_else(|| AppError::NotFound(format!("engine `{engine_id}` is not registered")))
+}
+
+fn deps_engines(
+    config_path: Option<&Path>,
+    engine_id: Option<&str>,
+    profile_name: Option<&str>,
+) -> Result<Vec<Box<dyn Engine>>> {
+    if let Some(engine_id) = engine_id {
+        return Ok(vec![find_engine(engine_id)?]);
+    }
+
+    let config = match config_path {
+        Some(path) => Config::load(path)?,
+        None => Config::load_default()?,
+    };
+
+    if let Some(name) = profile_name {
+        let profile = config
+            .profile(name)
+            .ok_or_else(|| AppError::NotFound(format!("profile `{name}`")))?;
+        if let Some(engine_id) = &profile.engine {
+            return Ok(vec![find_engine(engine_id)?]);
+        }
+        let provider = registry()
+            .into_iter()
+            .find(|provider| provider.id() == profile.provider.to_string())
+            .ok_or_else(|| {
+                AppError::Unsupported(format!(
+                    "no provider implementation for `{}`",
+                    profile.provider
+                ))
+            })?;
+        return Ok(dedupe_engines(provider.engines()));
+    }
+
+    let ids: Vec<&str> = config
+        .profiles
+        .values()
+        .filter_map(|profile| profile.engine.as_deref())
+        .collect();
+    if ids.is_empty() {
+        return Ok(dedupe_engines(all_engines()));
+    }
+    let selected: Vec<Box<dyn Engine>> = all_engines()
+        .into_iter()
+        .filter(|engine| ids.contains(&engine.id()))
+        .collect();
+    if selected.is_empty() {
+        Ok(dedupe_engines(all_engines()))
+    } else {
+        Ok(dedupe_engines(selected))
+    }
+}
+
+fn collect_dependencies(engines: &[Box<dyn Engine>]) -> Vec<deps::Dependency> {
+    let mut seen: Vec<&'static str> = Vec::new();
+    let mut dependencies = Vec::new();
+    for engine in engines {
+        for dependency in engine.runtime_deps() {
+            if !seen.contains(&dependency.id) {
+                seen.push(dependency.id);
+                dependencies.push(dependency);
+            }
+        }
+    }
+    dependencies
+}
+
 fn cmd_providers() -> Result<()> {
     let providers = registry();
     if providers.is_empty() {
@@ -354,7 +518,13 @@ fn cmd_providers() -> Result<()> {
     Ok(())
 }
 
-fn cmd_install(engine_id: &str, method: InstallMethodArg, dry_run: bool, yes: bool) -> Result<()> {
+fn cmd_install(
+    engine_id: &str,
+    method: InstallMethodArg,
+    dry_run: bool,
+    yes: bool,
+    no_deps: bool,
+) -> Result<()> {
     let request = match method {
         InstallMethodArg::Auto => InstallRequest::Auto,
         InstallMethodArg::Pkg => InstallRequest::Pkg,
@@ -367,14 +537,24 @@ fn cmd_install(engine_id: &str, method: InstallMethodArg, dry_run: bool, yes: bo
     for provider in registry() {
         for engine in provider.engines() {
             if engine.id() == engine_id {
-                return install::install_engine(
+                install::install_engine(
                     engine.as_ref(),
                     &detected_distro,
                     manager,
                     request,
                     dry_run,
                     yes,
-                );
+                )?;
+                if !no_deps {
+                    install::install_dependencies(
+                        &engine.runtime_deps(),
+                        &detected_distro,
+                        &manager,
+                        dry_run,
+                        true,
+                    )?;
+                }
+                return Ok(());
             }
         }
     }
@@ -694,6 +874,7 @@ fn cmd_config_set(path: &Path, key: &str, value: &str) -> Result<()> {
         "general.mount_root" => config.general.mount_root = PathBuf::from(value),
         "general.allow_other" => config.general.allow_other = parse_bool(value)?,
         "general.engine_auto_fallback" => config.general.engine_auto_fallback = parse_bool(value)?,
+        "general.auto_install" => config.general.auto_install = parse_bool(value)?,
         "general.log_level" => {
             config.general.log_level = if value.is_empty() {
                 None

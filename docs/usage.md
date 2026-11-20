@@ -60,8 +60,9 @@ ls ~/mnt/photos
 
 ## Host checks: `doctor` and `providers`
 
-`mount-fs doctor` reports the distro, package manager, `/dev/fuse`,
-`fusermount3`, `/etc/fuse.conf`, privilege escalation, and active FUSE mounts.
+`mount-fs doctor` reports the distro, package manager, runtime dependencies
+(`/dev/fuse`, `fusermount3`, `rclone`), `/etc/fuse.conf`, privilege escalation,
+and active FUSE mounts.
 It is advisory: a `[WARN]` explains what is missing but does not block commands
 that do not need it.
 
@@ -84,7 +85,30 @@ mount-fs install aliyundrive-fuse
 
 Use `--dry-run` to see the package/download/source-build plan without changing
 the system. Release archives require `--yes` because they download and execute
-an installation; source builds require `--method source --yes`.
+an installation; source builds require `--method source --yes`. Engines also
+install their runtime dependencies (e.g. `fuse3`, and `rclone` for the webdav
+bridge) after installation; pass `--no-deps` to skip that.
+
+## Runtime dependencies
+
+```sh
+mount-fs deps                                  # all configured engines
+mount-fs deps --engine aliyundrive-webdav --json
+mount-fs deps --profile aliyun
+mount-fs deps install --engine aliyundrive-webdav --dry-run
+mount-fs deps install --engine aliyundrive-webdav
+```
+
+`deps` reports `/dev/fuse`, `fusermount3` (package `fuse3`), and `rclone` (needed
+by `aliyundrive-webdav`). `deps install` installs the missing packages through
+the system package manager (with the usual escalation). A missing kernel device
+such as `/dev/fuse` cannot be installed and is reported with guidance.
+
+Mounting also checks dependencies. `mount --auto-install` (or
+`general.auto_install = true` in the config) installs a missing engine and its
+dependencies before mounting; without it, mount fails with the exact
+`install`/`deps install` command to run. Auto-install never compiles from source
+automatically and never runs unless explicitly enabled.
 
 ## Profiles and configuration
 
@@ -286,7 +310,7 @@ selected with `mount-fs providers` and `mount-fs status <profile>`.
 ## Mount lifecycle
 
 ```sh
-mount-fs mount <profile> [--foreground] [--ro|--rw] [--allow-other] [--dry-run]
+mount-fs mount <profile> [--foreground] [--ro|--rw] [--allow-other] [--dry-run] [--auto-install]
 mount-fs umount <profile-or-mountpoint> [--force]
 mount-fs list [--json]
 mount-fs status <profile> [--json]

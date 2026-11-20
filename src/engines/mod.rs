@@ -274,6 +274,11 @@ pub trait Engine: Send + Sync {
     /// Engine capabilities.
     fn capabilities(&self) -> Capabilities;
 
+    /// Runtime dependencies required to mount (binaries/devices).
+    fn runtime_deps(&self) -> Vec<crate::system::deps::Dependency> {
+        crate::system::deps::common_deps()
+    }
+
     /// Token system consumed by this engine.
     fn token_kind(&self) -> TokenKind;
 

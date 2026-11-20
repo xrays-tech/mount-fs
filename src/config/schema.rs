@@ -42,6 +42,7 @@ pub const CONFIG_TEMPLATE: &str = r#"# mount-fs configuration
 mount_root = "~/mnt"
 allow_other = false
 engine_auto_fallback = true
+# auto_install = false
 # log_level = "info"
 
 # Aliyun example (qrypt requires a drive id and an OpenAPI refresh token):
@@ -77,6 +78,8 @@ pub struct General {
     pub allow_other: bool,
     /// Whether to fall back to an alternative engine automatically.
     pub engine_auto_fallback: bool,
+    /// Whether `mount` may install missing engines/dependencies automatically.
+    pub auto_install: bool,
     /// Optional log level override.
     pub log_level: Option<String>,
 }
@@ -87,6 +90,7 @@ impl Default for General {
             mount_root: PathBuf::from("~/mnt"),
             allow_other: false,
             engine_auto_fallback: true,
+            auto_install: false,
             log_level: None,
         }
     }
@@ -407,6 +411,13 @@ options = { uid = 1000, gid = 1000, umask = "077", cache = "~/.cache/mount-fs/bu
         .expect("config");
         let profile = config.profile("pan").expect("profile");
         assert_eq!(profile.drive_type.as_deref(), Some("resource"));
+    }
+
+    #[test]
+    fn parses_auto_install() {
+        assert!(!Config::parse("").expect("empty").general.auto_install);
+        let config = Config::parse("[general]\nauto_install = true\n").expect("config");
+        assert!(config.general.auto_install);
     }
 
     #[test]

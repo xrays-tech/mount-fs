@@ -5,6 +5,7 @@
 //! The `doctor` report aggregates the environment checks.
 
 pub mod checksums;
+pub mod deps;
 pub mod distro;
 pub mod download;
 pub mod fuse;
@@ -31,11 +32,36 @@ pub fn doctor(fix: bool) -> Result<()> {
     report_fuse();
     report_privilege();
     report_fuse_mounts();
+    report_dependencies();
 
     if fix {
         apply_fuse_fix();
+        if deps::check(&all_doctor_deps())
+            .iter()
+            .any(|status| !status.present && !status.dependency.packages.is_empty())
+        {
+            println!(
+                "[WARN] dependencies: run `mount-fs deps install` (or `mount-fs deps install --dry-run`)"
+            );
+        }
     }
     Ok(())
+}
+
+fn all_doctor_deps() -> Vec<deps::Dependency> {
+    let mut list = deps::common_deps();
+    list.push(deps::rclone_dependency());
+    list
+}
+
+fn report_dependencies() {
+    for status in deps::check(&all_doctor_deps()) {
+        let tag = if status.present { "[ OK ]" } else { "[WARN]" };
+        println!(
+            "{tag} Dependency: {} ({})",
+            status.dependency.description, status.detail
+        );
+    }
 }
 
 /// Safe, minimal `doctor --fix`: only touches `/etc/fuse.conf`.

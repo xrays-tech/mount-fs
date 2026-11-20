@@ -30,8 +30,8 @@ by a profile's `credentials_ref`.
 
 ## Capabilities
 
-- Detect, install, and uninstall supported mount engines (`install`,
-  `uninstall`, `providers`).
+- Detect, install, and uninstall supported mount engines and their runtime
+  dependencies (`install`, `deps`, `uninstall`, `providers`).
 - Configure providers and credentials (`config init|list|get|set|login|logout`).
 - Manually invoked and unattended mounts (`mount`, `umount`, `list`,
   `status`, `logs`, `service`).
