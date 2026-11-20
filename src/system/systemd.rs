@@ -44,6 +44,8 @@ pub fn render_unit(profile: &str, mountpoint: &Path, exec: &Path) -> String {
 Description=mount-fs: {profile}
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -162,6 +164,8 @@ mod tests {
         assert!(unit.contains("ExecStopPost=-fusermount3 -u /home/u/mnt/pan"));
         assert!(unit.contains("WantedBy=default.target"));
         assert!(unit.contains("RestartSec=5"));
+        assert!(unit.contains("StartLimitIntervalSec=60"));
+        assert!(unit.contains("StartLimitBurst=5"));
     }
 
     #[test]

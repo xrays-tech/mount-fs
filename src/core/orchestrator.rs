@@ -23,7 +23,7 @@ use crate::core::state::{self, MountRecord, StateRegistry};
 use crate::engines::{CredentialRetention, EffectiveMount, MountSecrets, Readiness, TokenKind};
 use crate::error::{AppError, Result};
 use crate::providers;
-use crate::system::fuse::{self, MountSource};
+use crate::system::fuse::{self, MountEntry, MountSource};
 use crate::system::locking::FileLock;
 use crate::system::net;
 use crate::system::process::{self, CommandSpec};
@@ -36,6 +36,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIDECAR_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(500);
 const STEP_TIMEOUT: Duration = Duration::from_secs(1);
+const STALE_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct SidecarSpec {
     spec: CommandSpec,
@@ -312,12 +313,7 @@ pub fn mount(
     }
 
     let requested = profile.mountpoint.clone();
-    if !requested.exists() {
-        // Only set the mode at creation; never chmod a pre-existing directory.
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o755);
-        builder.create(&requested)?;
-    }
+    ensure_mountpoint_dir(source, &requested)?;
     // Canonicalize so the kernel mount target (mountinfo) matches. A missing
     // path falls back to an absolute path instead of panicking.
     let mountpoint = match fs::canonicalize(&requested) {
@@ -373,12 +369,15 @@ pub fn mount(
 
     if opts.foreground {
         return mount_foreground(
-            &spec,
-            &sidecars,
-            &profile_name,
-            &profile,
-            engine.id(),
-            &mountpoint,
+            ForegroundSpec {
+                source,
+                spec: &spec,
+                sidecars: &sidecars,
+                profile_name: &profile_name,
+                profile: &profile,
+                engine_id: engine.id(),
+                mountpoint: &mountpoint,
+            },
             credential_path,
         );
     }
@@ -534,15 +533,26 @@ fn pid_records(children: &[Child]) -> Vec<PidRecord> {
         .collect()
 }
 
-fn mount_foreground(
-    spec: &CommandSpec,
-    sidecars: &[SidecarSpec],
-    profile_name: &str,
-    profile: &Profile,
-    engine_id: &str,
-    mountpoint: &Path,
-    credential_path: Option<PathBuf>,
-) -> Result<()> {
+struct ForegroundSpec<'a> {
+    source: &'a dyn MountSource,
+    spec: &'a CommandSpec,
+    sidecars: &'a [SidecarSpec],
+    profile_name: &'a str,
+    profile: &'a Profile,
+    engine_id: &'a str,
+    mountpoint: &'a Path,
+}
+
+fn mount_foreground(ctx: ForegroundSpec<'_>, credential_path: Option<PathBuf>) -> Result<()> {
+    let ForegroundSpec {
+        source,
+        spec,
+        sidecars,
+        profile_name,
+        profile,
+        engine_id,
+        mountpoint,
+    } = ctx;
     let interrupted = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(
         signal_hook::consts::signal::SIGINT,
@@ -613,6 +623,7 @@ fn mount_foreground(
             let _ = child.kill();
             let _ = child.wait();
             kill_children(&mut sidecar_children);
+            recover_foreground_mount(source, mountpoint);
             cleanup_foreground(profile_name, &credential_path);
             eprintln!("interrupted; shutting down");
             std::process::exit(130);
@@ -621,6 +632,7 @@ fn mount_foreground(
         match child.try_wait() {
             Ok(Some(status)) => {
                 kill_children(&mut sidecar_children);
+                recover_foreground_mount(source, mountpoint);
                 cleanup_foreground(profile_name, &credential_path);
                 if !status.success() {
                     return Err(AppError::Unsupported(format!(
@@ -633,6 +645,7 @@ fn mount_foreground(
             Err(err) => {
                 let _ = child.kill();
                 kill_children(&mut sidecar_children);
+                recover_foreground_mount(source, mountpoint);
                 cleanup_foreground(profile_name, &credential_path);
                 return Err(err.into());
             }
@@ -666,6 +679,17 @@ fn spawn_foreground_sidecars(sidecars: &[SidecarSpec]) -> Result<Vec<Child>> {
         }
     }
     Ok(children)
+}
+
+/// If a foreground engine exited but left its mount behind, try a lazy unmount.
+fn recover_foreground_mount(source: &dyn MountSource, mountpoint: &Path) {
+    let deadline = Instant::now() + TERMINATION_GRACE;
+    if wait_mount_absent(source, mountpoint, deadline) {
+        return;
+    }
+    run_fusermount(mountpoint, true);
+    let deadline = Instant::now() + STALE_TIMEOUT;
+    let _ = wait_mount_absent(source, mountpoint, deadline);
 }
 
 /// Remove the foreground state record and credential artifact (best effort).
@@ -717,6 +741,83 @@ fn wait_for_mount(
             )));
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// A path is a stale FUSE mount when the kernel still lists it as a FUSE
+/// mount but the path cannot be stat'ed (e.g. ENOTCONN after the engine died).
+pub(crate) fn is_stale_fuse_mount(path: &Path, mounts: &[MountEntry], metadata_ok: bool) -> bool {
+    !metadata_ok
+        && mounts
+            .iter()
+            .any(|mount| mount.target.as_path() == path && fuse::is_fuse_fstype(&mount.fstype))
+}
+
+fn stale_mount_error(path: &Path) -> AppError {
+    AppError::Unsupported(format!(
+        "stale FUSE mount at {}; run: fusermount3 -uz {} (or mount-fs umount --force)",
+        path.display(),
+        path.display()
+    ))
+}
+
+/// Lazy-unmount a stale mount and wait briefly for the kernel entry to clear.
+fn recover_stale_mount(source: &dyn MountSource, path: &Path) -> Result<()> {
+    run_fusermount(path, true);
+    let deadline = Instant::now() + STALE_TIMEOUT;
+    if wait_mount_absent(source, path, deadline) {
+        Ok(())
+    } else {
+        Err(stale_mount_error(path))
+    }
+}
+
+fn mountpoint_metadata_is_dir(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+}
+
+/// Ensure the mountpoint directory exists, recovering a stale FUSE mount at the
+/// same path (where `exists()`/`create()` can fail with ENOTCONN/EEXIST).
+fn ensure_mountpoint_dir(source: &dyn MountSource, path: &Path) -> Result<()> {
+    let mounts = source.list().unwrap_or_default();
+    if is_stale_fuse_mount(path, &mounts, fs::metadata(path).is_ok()) {
+        recover_stale_mount(source, path)?;
+    }
+
+    let create = || {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o755);
+        builder.create(path)
+    };
+
+    match create() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            if mountpoint_metadata_is_dir(path) {
+                return Ok(());
+            }
+            // A stale mount can make mkdir return EEXIST while metadata fails.
+            let mounts = source.list().unwrap_or_default();
+            if is_stale_fuse_mount(path, &mounts, false) {
+                recover_stale_mount(source, path)?;
+                match create() {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if mountpoint_metadata_is_dir(path) {
+                            Ok(())
+                        } else {
+                            Err(err.into())
+                        }
+                    }
+                    Err(err) => Err(err.into()),
+                }
+            } else {
+                Err(err.into())
+            }
+        }
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -978,6 +1079,19 @@ fn escalate_unmount(source: &dyn MountSource, record: &MountRecord, force: bool)
     }
     if wait_mount_absent(source, mountpoint, step(deadline)) {
         return Ok(());
+    }
+
+    // (c2) dead-engine recovery: if the engine is gone but the mount persists,
+    // a lazy unmount is safe even without --force.
+    let main_dead = match record.pid {
+        Some(pid) => !engine_alive(pid, record.starttime),
+        None => true,
+    };
+    if main_dead && !force {
+        run_fusermount(mountpoint, true);
+        if wait_mount_absent(source, mountpoint, step(deadline)) {
+            return Ok(());
+        }
     }
 
     // (d) forced escalation: lazy unmount + SIGKILL after a short grace.
@@ -1313,5 +1427,38 @@ fn apply_overrides(profile: &mut Profile, opts: &MountOptionsArg) {
     }
     if let Some(allow_other) = opts.allow_other {
         profile.allow_other = allow_other;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mount_entry(target: &str, fstype: &str) -> MountEntry {
+        MountEntry {
+            mount_id: 1,
+            parent_id: 0,
+            source: "src".to_string(),
+            target: PathBuf::from(target),
+            fstype: fstype.to_string(),
+            options: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stale_fuse_mount_requires_fuse_and_broken_metadata() {
+        let path = Path::new("/mnt/broken");
+        let mounts = vec![mount_entry("/mnt/broken", "fuse.rclone")];
+        assert!(is_stale_fuse_mount(path, &mounts, false));
+
+        // Reachable metadata means a normal directory, not a stale mount.
+        assert!(!is_stale_fuse_mount(path, &mounts, true));
+
+        // Not present in mountinfo -> not a mount at all.
+        assert!(!is_stale_fuse_mount(path, &[], false));
+
+        // Non-FUSE mount at the same path -> not our stale FUSE mount.
+        let non_fuse = vec![mount_entry("/mnt/broken", "ext4")];
+        assert!(!is_stale_fuse_mount(path, &non_fuse, false));
     }
 }
